@@ -1,0 +1,210 @@
+diff --git a/src/app/(dashboard)/dashboard/media-providers/components/ImageExampleCard.tsx b/src/app/(dashboard)/dashboard/media-providers/components/ImageExampleCard.tsx
+--- a/src/app/(dashboard)/dashboard/media-providers/components/ImageExampleCard.tsx
++++ b/src/app/(dashboard)/dashboard/media-providers/components/ImageExampleCard.tsx
+@@ -8,6 +8,7 @@
+ import { buildCurl } from "../../providers/utils/buildCurl";
+ import { filterModelsByKind } from "../../providers/utils/serviceKinds";
+ import { detectImageMime, imageExtension } from "../../providers/utils/imageMime";
++import { qualifyModelId } from "../../providers/utils/mediaModels";
+ import { PLAYGROUND_KEY_ID_HEADER, resolvePlaygroundKeyId } from "../../providers/utils/playgroundAuth";
+ import { PlaygroundCard } from "./PlaygroundCard";
+ 
+@@ -153,7 +154,7 @@
+ 
+   const effectiveModel = model || firstModel;
+   // Only fields every provider accepts: Logfare flux models reject `n` and `response_format`.
+-  const buildBody = () => ({ model: effectiveModel, prompt, size });
++  const buildBody = () => ({ model: qualifyModelId(providerId, effectiveModel), prompt, size });
+ 
+   const curlSnippet = buildCurl({
+     endpoint:
+diff --git a/src/app/(dashboard)/dashboard/media-providers/components/TtsExampleCard.tsx b/src/app/(dashboard)/dashboard/media-providers/components/TtsExampleCard.tsx
+--- a/src/app/(dashboard)/dashboard/media-providers/components/TtsExampleCard.tsx
++++ b/src/app/(dashboard)/dashboard/media-providers/components/TtsExampleCard.tsx
+@@ -6,6 +6,7 @@
+ import { useProviderModels } from "../../providers/hooks/useProviderModels";
+ import { buildCurl } from "../../providers/utils/buildCurl";
+ import { filterModelsByKind } from "../../providers/utils/serviceKinds";
++import { qualifyModelId } from "../../providers/utils/mediaModels";
+ import { PLAYGROUND_KEY_ID_HEADER, resolvePlaygroundKeyId } from "../../providers/utils/playgroundAuth";
+ import { PlaygroundCard } from "./PlaygroundCard";
+ 
+@@ -46,7 +47,7 @@
+ 
+   const effectiveModel = model || firstModel;
+   const buildBody = () => ({
+-    model: effectiveModel,
++    model: qualifyModelId(providerId, effectiveModel),
+     voice,
+     input: inputText,
+     speed: parseFloat(speed) || 1.0,
+diff --git a/src/app/(dashboard)/dashboard/media-providers/components/SttExampleCard.tsx b/src/app/(dashboard)/dashboard/media-providers/components/SttExampleCard.tsx
+--- a/src/app/(dashboard)/dashboard/media-providers/components/SttExampleCard.tsx
++++ b/src/app/(dashboard)/dashboard/media-providers/components/SttExampleCard.tsx
+@@ -6,6 +6,7 @@
+ import { useProviderModels } from "../../providers/hooks/useProviderModels";
+ import { PlaygroundCard } from "./PlaygroundCard";
+ import { buildCurl } from "../../providers/utils/buildCurl";
++import { extractTranscript, qualifyModelId } from "../../providers/utils/mediaModels";
+ import { PLAYGROUND_KEY_ID_HEADER, resolvePlaygroundKeyId } from "../../providers/utils/playgroundAuth";
+ 
+ interface Props {
+@@ -26,8 +27,7 @@
+ 
+ function SttResultRenderer(data: unknown) {
+   if (!data || typeof data !== "object") return null;
+-  const d = data as Record<string, unknown>;
+-  const text = typeof d.text === "string" ? d.text : null;
++  const text = extractTranscript(data);
+   if (text !== null) {
+     return (
+       <div className="p-3">
+@@ -65,7 +65,7 @@
+   // OpenRouter connection) would misroute. Qualify it with this connection's
+   // provider id at submit time. Single-token ids (e.g. "whisper-1") already
+   // lack a slash and pass through unchanged once prefixed.
+-  const qualify = (id: string) => (id.startsWith(`${providerId}/`) ? id : `${providerId}/${id}`);
++  const qualify = (id: string) => qualifyModelId(providerId, id);
+ 
+   // cURL is multipart — show a representative snippet
+   const curlSnippet = buildCurl({
+diff --git a/src/i18n/messages/en.json b/src/i18n/messages/en.json
+--- a/src/i18n/messages/en.json
++++ b/src/i18n/messages/en.json
+@@ -2462,6 +2462,7 @@
+     "videoDescription": "Create videos with AnimateDiff, Stable Video Diffusion via ComfyUI or SD WebUI.",
+     "musicDescription": "Compose music using Stable Audio Open or MusicGen via ComfyUI.",
+     "kinds": {
++      "llm": "Chat",
+       "embedding": "Embedding",
+       "image": "Image",
+       "imageToText": "Image to Text",
+diff --git a/open-sse/config/audioRegistry.ts b/open-sse/config/audioRegistry.ts
+--- a/open-sse/config/audioRegistry.ts
++++ b/open-sse/config/audioRegistry.ts
+@@ -34,6 +34,16 @@
+ }
+ 
+ export const AUDIO_TRANSCRIPTION_PROVIDERS: Record<string, AudioProvider> = {
++  logfare: {
++    id: "logfare",
++    baseUrl: "https://logfare.ai/v1/audio/transcriptions",
++    authType: "apikey",
++    authHeader: "bearer",
++    models: [
++      { id: "nova-3", name: "Deepgram Nova 3" },
++      { id: "whisper-large-v3-turbo", name: "Whisper Large v3 Turbo" },
++    ],
++  },
+   vertex: {
+     id: "vertex",
+     baseUrl: "https://us-central1-aiplatform.googleapis.com/v1",
+@@ -287,6 +297,13 @@
+ };
+ 
+ export const AUDIO_SPEECH_PROVIDERS: Record<string, AudioProvider> = {
++  logfare: {
++    id: "logfare",
++    baseUrl: "https://logfare.ai/v1/audio/speech",
++    authType: "apikey",
++    authHeader: "bearer",
++    models: [{ id: "aura-2-en", name: "Deepgram Aura 2" }],
++  },
+   google: {
+     id: "google",
+     credentialProviderId: "gemini",
+diff --git a/src/app/(dashboard)/dashboard/providers/utils/mediaModels.ts b/src/app/(dashboard)/dashboard/providers/utils/mediaModels.ts
+new file mode 100644
+--- /dev/null
++++ b/src/app/(dashboard)/dashboard/providers/utils/mediaModels.ts
+@@ -0,0 +1,37 @@
++/**
++ * Prefix a model id with the connection provider id, unless it already has it.
++ * The image / speech / transcription routes resolve the provider from the leading
++ * segment of the submitted model id, so a bare id such as "flux-1-schnell" can
++ * resolve to an unrelated built-in provider.
++ */
++export function qualifyModelId(providerId: string, id: string): string {
++  return id.startsWith(`${providerId}/`) ? id : `${providerId}/${id}`;
++}
++
++function asRecord(v: unknown): Record<string, unknown> | null {
++  return v && typeof v === "object" ? (v as Record<string, unknown>) : null;
++}
++
++/**
++ * Transcript text from a speech-to-text response. Handles the OpenAI shape
++ * ({ text }), the Logfare whisper shape ({ result: { text } }) and the Logfare
++ * Deepgram-style nova shape
++ * ({ result: { results: { channels: [{ alternatives: [{ transcript }] }] } } }).
++ */
++export function extractTranscript(data: unknown): string | null {
++  const d = asRecord(data);
++  if (!d) return null;
++  if (typeof d.text === "string") return d.text;
++  const result = asRecord(d.result);
++  if (!result) return null;
++  if (typeof result.text === "string") return result.text;
++  const channels = asRecord(result.results)?.channels;
++  if (Array.isArray(channels)) {
++    const alternatives = asRecord(channels[0])?.alternatives;
++    if (Array.isArray(alternatives)) {
++      const transcript = asRecord(alternatives[0])?.transcript;
++      if (typeof transcript === "string") return transcript;
++    }
++  }
++  return null;
++}
+diff --git a/tests/unit/playground-media-models.test.ts b/tests/unit/playground-media-models.test.ts
+new file mode 100644
+--- /dev/null
++++ b/tests/unit/playground-media-models.test.ts
+@@ -0,0 +1,48 @@
++import test from "node:test";
++import assert from "node:assert/strict";
++import {
++  qualifyModelId,
++  extractTranscript,
++} from "../../src/app/(dashboard)/dashboard/providers/utils/mediaModels.ts";
++
++test("qualifyModelId prefixes a bare model id with the provider id", () => {
++  assert.equal(qualifyModelId("logfare", "flux-1-schnell"), "logfare/flux-1-schnell");
++});
++
++test("qualifyModelId leaves an already qualified id alone", () => {
++  assert.equal(qualifyModelId("logfare", "logfare/aura-2-en"), "logfare/aura-2-en");
++});
++
++test("qualifyModelId keeps vendor-prefixed ids under the connection provider", () => {
++  assert.equal(
++    qualifyModelId("openrouter", "openai/gpt-image-1"),
++    "openrouter/openai/gpt-image-1"
++  );
++});
++
++test("extractTranscript reads the OpenAI-style top-level text", () => {
++  assert.equal(extractTranscript({ text: "hello world" }), "hello world");
++});
++
++test("extractTranscript reads the Logfare whisper result.text shape", () => {
++  assert.equal(
++    extractTranscript({ result: { text: "Hello from OmniRoute.", word_count: 3 } }),
++    "Hello from OmniRoute."
++  );
++});
++
++test("extractTranscript reads the Logfare nova Deepgram-style transcript", () => {
++  const data = {
++    result: {
++      results: { channels: [{ alternatives: [{ transcript: "good morning", confidence: 0.99 }] }] },
++    },
++  };
++  assert.equal(extractTranscript(data), "good morning");
++});
++
++test("extractTranscript returns null for unknown shapes and bad input", () => {
++  assert.equal(extractTranscript({ foo: 1 }), null);
++  assert.equal(extractTranscript(null), null);
++  assert.equal(extractTranscript("x"), null);
++  assert.equal(extractTranscript({ result: { results: { channels: [] } } }), null);
++});

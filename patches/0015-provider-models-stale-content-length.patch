@@ -1,0 +1,176 @@
+diff --git a/src/app/api/v1/providers/[provider]/models/route.ts b/src/app/api/v1/providers/[provider]/models/route.ts
+index 9e5450be9..978d9282a 100644
+--- a/src/app/api/v1/providers/[provider]/models/route.ts
++++ b/src/app/api/v1/providers/[provider]/models/route.ts
+@@ -4,6 +4,24 @@ import { isServiceBackendPluginId } from "@/lib/services/serviceBackends";
+ import { getRegistryEntry } from "@omniroute/open-sse/config/providerRegistry.ts";
+ import { getProviderById, getProviderByAlias } from "@/shared/constants/providers";
+ import { isCompatibleProviderConnectionId } from "@/shared/utils/compatibleProviderId";
++import { getProviderNodeById } from "@/lib/db/providers/nodes";
++
++// Mirrors resolvePublicOwnerId()'s prefix resolution in
++// src/app/api/v1/models/catalog.ts: the catalog never leaks a compatible
++// node's raw internal id/uuid into the public `owned_by` field, it resolves
++// to the operator's configured prefix (falling back to a slugified name)
++// there instead. This route must resolve a connection-id-shaped `provider`
++// param the same way before filtering by `owned_by`, or the filter can
++// never match — every compatible provider's model list came back empty.
++function resolveCompatibleNodePrefix(node: { prefix?: unknown; name?: unknown } | null): string | null {
++  if (!node) return null;
++  const prefix = typeof node.prefix === "string" ? node.prefix.trim() : "";
++  if (prefix) return prefix;
++  const name = typeof node.name === "string" ? node.name.trim() : "";
++  if (!name) return null;
++  const slug = name.toLowerCase().replace(/\s+/g, "-").replace(/[^a-z0-9-]/g, "");
++  return slug || null;
++}
+ 
+ /**
+  * Handle CORS preflight
+@@ -65,6 +83,16 @@ export async function GET(request: Request, { params }: { params: Promise<{ prov
+           { status: 400 }
+         );
+       }
++      // `rawProvider` here is the compatible provider NODE's own id (a
++      // "<type>-<uuid>" string). The catalog tags that node's models with
++      // its public PREFIX, not this raw id — resolve it the same way so the
++      // owned_by filter below can actually match.
++      const node = await getProviderNodeById(rawProvider);
++      const resolvedPrefix = resolveCompatibleNodePrefix(node);
++      if (resolvedPrefix) {
++        providerId = resolvedPrefix;
++        providerAlias = resolvedPrefix;
++      }
+     }
+   }
+ 
+@@ -103,6 +131,20 @@ export async function GET(request: Request, { params }: { params: Promise<{ prov
+     });
+   }
+ 
++  // `response.headers` describes getUnifiedModelsResponse()'s ORIGINAL,
++  // unfiltered body (often the whole multi-provider catalog — ~500 KB+).
++  // The body below is a freshly filtered/deduped subset of that, almost
++  // always much smaller. Forwarding response.headers verbatim carries its
++  // stale Content-Length onto the new, shorter body: the client is promised
++  // N bytes but the connection closes after the real (smaller) body is
++  // written, which surfaces as "upstream prematurely closed connection" at
++  // the proxy and `TypeError: Failed to fetch` in the browser. Content-Length
++  // (and Content-Encoding, which also describes the old body's bytes) must be
++  // dropped so the runtime computes both fresh for the new body.
++  const forwardedHeaders = new Headers(response.headers);
++  forwardedHeaders.delete("content-length");
++  forwardedHeaders.delete("content-encoding");
++
+   return Response.json(
+     {
+       object: payload.object || "list",
+@@ -110,7 +152,7 @@ export async function GET(request: Request, { params }: { params: Promise<{ prov
+     },
+     {
+       status: response.status,
+-      headers: response.headers,
++      headers: forwardedHeaders,
+     }
+   );
+ }
+diff --git a/tests/unit/provider-models-v1-route.test.ts b/tests/unit/provider-models-v1-route.test.ts
+index af92b95b4..4668f8540 100644
+--- a/tests/unit/provider-models-v1-route.test.ts
++++ b/tests/unit/provider-models-v1-route.test.ts
+@@ -16,6 +16,9 @@ process.env.DATA_DIR = TEST_DATA_DIR;
+ 
+ const core = await import("../../src/lib/db/core.ts");
+ const serviceModelsDb = await import("../../src/lib/db/serviceModels.ts");
++const nodesDb = await import("../../src/lib/db/providers/nodes.ts");
++const providersDb = await import("../../src/lib/db/providers.ts");
++const modelsDb = await import("../../src/lib/db/models.ts");
+ const routeModule = await import("../../src/app/api/v1/providers/[provider]/models/route.ts");
+ 
+ function makeRequest(provider: string) {
+@@ -112,6 +115,85 @@ test("GET /v1/providers/:provider/models returns synced embedded service models"
+   assert.equal(body.data[0].parent, null);
+ });
+ 
++test("GET /v1/providers/:provider/models never advertises a Content-Length larger than the actual body", async () => {
++  // Regression guard: the route clones getUnifiedModelsResponse()'s response
++  // (often the whole multi-provider catalog — hundreds of KB), filters it
++  // down to this one provider's (usually much smaller) subset, then used to
++  // forward the ORIGINAL response's headers verbatim onto the NEW, shorter
++  // body. That carried a stale, too-large Content-Length onto the filtered
++  // body: the client was promised N bytes but the connection closed after
++  // the real (smaller) body was written — "upstream prematurely closed
++  // connection" at the proxy, `TypeError: Failed to fetch` in the browser.
++  // A provider with zero matches (real, valid compatible-connection-id shape,
++  // but no models registered under it) reproduces the worst case: the full
++  // unfiltered catalog's Content-Length forwarded onto an empty `data: []`.
++  serviceModelsDb.saveServiceModels("cliproxyapi", [{ id: "cli/gpt-5", name: "GPT-5" }]);
++
++  const res = await callGET("cliproxyapi");
++  const bodyText = await res.text();
++  const actualBytes = new TextEncoder().encode(bodyText).length;
++  const declaredLength = res.headers.get("content-length");
++
++  if (declaredLength !== null) {
++    assert.equal(
++      Number(declaredLength),
++      actualBytes,
++      `Content-Length (${declaredLength}) must match the actual filtered body (${actualBytes} bytes), ` +
++        "not a stale length inherited from the unfiltered upstream response"
++    );
++  }
++  assert.equal(res.headers.get("content-encoding"), null);
++});
++
++test("GET /v1/providers/:provider/models resolves a compatible connection ID to its node prefix for owned_by filtering", async () => {
++  // Regression guard: the catalog (src/app/api/v1/models/catalog.ts,
++  // resolvePublicOwnerId) deliberately tags a compatible provider node's
++  // models with its PUBLIC PREFIX in `owned_by`, never the raw node
++  // id/uuid, so internal ids never leak into a public API response. This
++  // route filtered by `owned_by === rawProvider` (the raw connection-id
++  // param) without ever resolving it to that same prefix first — so the
++  // filter could never match, and every compatible provider's playground
++  // model dropdown and "Available Models" list came back empty even when
++  // models were successfully synced (confirmed live for a real "apmix"
++  // node: owned_by was "apmix", the route was filtering for the raw
++  // "openai-compatible-chat-<uuid>" id).
++  const nodeId = "openai-compatible-chat-0000dead-0000-0000-0000-000000000000";
++  await nodesDb.createProviderNode({
++    id: nodeId,
++    type: "openai-compatible",
++    name: "Test Compat Provider",
++    prefix: "testprefix",
++    baseUrl: "https://example.com",
++    apiType: "chat",
++  });
++  // getAllActiveSyncedModels() (src/lib/db/models/activeSyncedCatalog.ts) only
++  // surfaces synced models for connection ids that also have a matching
++  // ACTIVE provider_connections row — a bare provider_nodes row is not enough.
++  const connection = await providersDb.createProviderConnection({
++    provider: nodeId,
++    authType: "apikey",
++    apiKey: "sk-test-owned-by",
++    name: "test-compat-owned-by",
++    isActive: true,
++    testStatus: "active",
++    priority: 1,
++    providerSpecificData: { prefix: "testprefix", baseUrl: "https://example.com" },
++  });
++  await modelsDb.replaceSyncedAvailableModelsForConnection(nodeId, String(connection.id), [
++    { id: "some-upstream-model", name: "Some Upstream Model" },
++  ]);
++
++  const res = await callGET(nodeId);
++  assert.equal(res.status, 200);
++  const body = await res.json();
++  assert.equal(body.object, "list");
++  assert.deepEqual(
++    body.data.map((model: any) => model.id),
++    ["some-upstream-model"]
++  );
++  assert.equal(body.data[0].owned_by, "testprefix");
++});
++
+ test("GET /v1/providers/:provider/models rejects non-matching connection-like strings", async () => {
+   // Looks like a connection ID but with wrong prefix
+   const res = await callGET("custom-compatible-chat-a1b2c3d4-e5f6-7890-abcd-ef1234567890");

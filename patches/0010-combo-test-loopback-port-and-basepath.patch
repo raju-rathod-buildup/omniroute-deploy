@@ -1,0 +1,41 @@
+diff --git a/src/app/api/combos/test/route.ts b/src/app/api/combos/test/route.ts
+index bd73410..c1bb7b0 100644
+--- a/src/app/api/combos/test/route.ts
++++ b/src/app/api/combos/test/route.ts
+@@ -198,6 +198,34 @@ export async function POST(request) {
+ }
+ 
+ function getInternalBaseUrl(): string {
+-  const { apiPort } = getRuntimePorts();
+-  return `http://127.0.0.1:${apiPort}`;
++  // dashboardPort, NOT apiPort. Verified 2026-08-21 from inside the container:
++  //   port 20129 (apiPort)      /v1/chat/completions      -> 404
++  //   port 20129 (apiPort)      /omni/v1/chat/completions -> 404   nothing serves it
++  //   port 20128 (dashboardPort) /omni/v1/chat/completions -> 401  route lives here
++  // Using apiPort made the health check report 404 for EVERY step of a combo whose
++  // models all work in real traffic. resolveModelSyncInternalBaseUrl() in
++  // shared/services/modelSyncScheduler.ts already uses dashboardPort correctly.
++  const { dashboardPort } = getRuntimePorts();
++  // The basePath MUST be included. Every route lives under OMNIROUTE_BASE_PATH
++  // (e.g. /omni), so a bare origin makes this loopback call hit a path that does
++  // not exist — and the combo health check then reports 404 "Not Found" for
++  // EVERY step, including models that work perfectly. Measured 2026-08-21:
++  // all 67 steps of a working combo reported error/404 in ~50ms each while real
++  // traffic through the same combo returned 200. A health check that marks
++  // healthy targets as broken is worse than no health check at all.
++  //
++  // Same defect class as patches 0001/0004/0006. `resolveModelSyncInternalBaseUrl`
++  // in shared/services/modelSyncScheduler.ts already does this correctly; this
++  // route hand-rolled its own origin and omitted the prefix.
++  return `http://127.0.0.1:${dashboardPort}${normalizeInternalBasePath(process.env.OMNIROUTE_BASE_PATH)}`;
++}
++
++/** Mirrors modelSyncScheduler's normalizer: strips unsafe/empty base paths. */
++function normalizeInternalBasePath(value: string | undefined): string {
++  const trimmed = value?.trim();
++  if (!trimmed || trimmed === "/") return "";
++  if (!trimmed.startsWith("/") || /[?#\\]/.test(trimmed)) return "";
++  const segments = trimmed.split("/").filter(Boolean);
++  if (segments.some((segment) => segment === "." || segment === "..")) return "";
++  return `/${segments.join("/")}`;
+ }

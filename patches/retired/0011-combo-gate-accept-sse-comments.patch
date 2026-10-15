@@ -1,0 +1,44 @@
+diff --git a/open-sse/services/combo/validateQuality.ts b/open-sse/services/combo/validateQuality.ts
+index 27f8e02..ba4f385 100644
+--- a/open-sse/services/combo/validateQuality.ts
++++ b/open-sse/services/combo/validateQuality.ts
+@@ -220,6 +220,30 @@ function parseJsonRecord(data: string): Record<string, unknown> | null {
+   }
+ }
+ 
++/**
++ * True when `text` is an SSE body rather than JSON.
++ *
++ * A bare `startsWith("data:")` test is not enough: per the SSE spec a line beginning
++ * with ":" is a COMMENT, and several providers open the stream with one as a
++ * keep-alive before the first frame — `nara` sends ": ka", `freetheai` sends
++ * ": freetheai keepalive". Those bodies were rejected as "response is not valid JSON",
++ * so every combo fell through every one of their steps while the very same models
++ * answered fine on a direct call. On this deploy that silently disabled 38 of 88 combo
++ * steps, including nara's 150M-tokens/day free tier (measured 8/8 probes, 2026-08-22).
++ *
++ * Skips leading blank and comment lines, then requires a real SSE field on the first
++ * substantive line. Bounded to the first 50 lines so a large non-SSE body cannot turn
++ * this into a long scan.
++ */
++function isServerSentEvents(text: string): boolean {
++  for (const line of text.split("\n").slice(0, 50)) {
++    const trimmed = line.trim();
++    if (!trimmed || trimmed.startsWith(":")) continue;
++    return /^(data|event|id|retry):/.test(trimmed);
++  }
++  return false;
++}
++
+ export async function validateResponseQuality(
+   response: Response,
+   isStreaming: boolean,
+@@ -583,7 +607,7 @@ export async function validateResponseQuality(
+   try {
+     json = JSON.parse(text);
+   } catch {
+-    if (text.startsWith("data:") || text.startsWith("event:")) return { valid: true };
++    if (isServerSentEvents(text)) return { valid: true };
+     return { valid: false, reason: "response is not valid JSON" };
+   }
+ 

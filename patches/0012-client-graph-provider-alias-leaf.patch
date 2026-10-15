@@ -1,0 +1,201 @@
+diff --git a/open-sse/services/model.ts b/open-sse/services/model.ts
+index ec0080ef8..e8040b6fa 100644
+--- a/open-sse/services/model.ts
++++ b/open-sse/services/model.ts
+@@ -1,4 +1,5 @@
+ import { PROVIDER_ID_TO_ALIAS, PROVIDER_MODELS } from "../config/providerModels.ts";
++import { ALIAS_TO_PROVIDER_ID, resolveProviderAlias } from "./providerAlias.ts";
+ import { resolveWildcardAlias } from "./wildcardRouter.ts";
+ import { getRegisteredProviderEffortBaseModelId } from "../utils/registeredEffortVariants.ts";
+ 
+@@ -27,37 +28,10 @@ export function stripContextWindowSuffix(
+   return modelStr.replace(CONTEXT_WINDOW_SUFFIX_RE, "").trimEnd();
+ }
+ 
+-// Derive alias→provider mapping from the single source of truth (PROVIDER_ID_TO_ALIAS)
+-// This prevents the two maps from drifting out of sync
+-const ALIAS_TO_PROVIDER_ID: Record<string, string> = {};
+-for (const [id, alias] of Object.entries(PROVIDER_ID_TO_ALIAS)) {
+-  if (ALIAS_TO_PROVIDER_ID[alias]) {
+-    console.log(
+-      `[MODEL] Warning: alias "${alias}" maps to both "${ALIAS_TO_PROVIDER_ID[alias]}" and "${id}". Using "${id}".`
+-    );
+-  }
+-  ALIAS_TO_PROVIDER_ID[alias] = id;
+-}
+-// Manual alias overrides — maps slug-style prefixes to canonical provider IDs.
+-// These live outside the registry because they represent multiple providers
+-// or backward-compatible slug changes, not a single provider's display name.
+-// opencode/ → opencode-zen (the main free/open tier; opencode-go is a separate paid tier)
+-ALIAS_TO_PROVIDER_ID["opencode"] = "opencode-zen";
+-// xiaomi/ is the user-visible prefix for MiMo models; register it so
+-// parseModel("xiaomi/mimo-v2-flash") resolves provider = "xiaomi-mimo" instead
+-// of falling through to the identity fallback ("xiaomi").
+-ALIAS_TO_PROVIDER_ID["xiaomi"] = "xiaomi-mimo";
+-// llamacpp/ is the user-visible alias for the llama-cpp self-hosted provider.
+-// The canonical ID is "llama-cpp" (with a hyphen), but the catalog and user-facing
+-// prefix is "llamacpp". Register it so parseModel("llamacpp/<model>") resolves
+-// provider = "llama-cpp" instead of the identity fallback ("llamacpp").
+-ALIAS_TO_PROVIDER_ID["llamacpp"] = "llama-cpp";
+-// agy/ is the short alias for antigravity provider.
+-ALIAS_TO_PROVIDER_ID["agy"] = "antigravity";
+-// aq/ is the user-visible prefix for the Amazon Q (AWS Builder ID) provider.
+-// The canonical provider ID is "amazon-q". Register it so parseModel("aq/<model>")
+-// resolves provider = "amazon-q" instead of falling through to the identity fallback.
+-ALIAS_TO_PROVIDER_ID["aq"] = "amazon-q";
++// LOCAL PATCH 0012 — ALIAS_TO_PROVIDER_ID and resolveProviderAlias moved verbatim to
++// ./providerAlias.ts so a client component can reach the alias helper without pulling
++// this module's DB graph into the browser bundle. See that file for the full rationale.
++// Re-exported below so every existing `from "…/services/model"` importer still works.
+ 
+ // Provider-scoped legacy model aliases. Used to normalize provider/model inputs
+ // and keep backward compatibility when upstream IDs change.
+@@ -180,30 +154,10 @@ interface ProviderConnectionLike {
+   is_active?: unknown;
+ }
+ 
+-/**
+- * Resolve provider alias to provider ID
+- */
+-export function resolveProviderAlias(aliasOrId: string | null | undefined): string | null {
+-  if (typeof aliasOrId !== "string") return null;
+-  // Follow the alias chain transitively so intermediate alias-only hops resolve
+-  // to the final target, but STOP as soon as a hop lands on a registered
+-  // provider id (#2901): "oc" must resolve to the no-auth "opencode" provider,
+-  // NOT continue through the manual "opencode" → "opencode-zen" slug override —
+-  // that override is for user-typed `opencode/` prefixes only. Without this
+-  // boundary the no-auth provider becomes unreachable by any prefix.
+-  // Guarded against infinite loops with both a depth limit and a seen-set.
+-  let current = aliasOrId;
+-  const seen = new Set<string>();
+-  for (let i = 0; i < 10; i++) {
+-    const next = ALIAS_TO_PROVIDER_ID[current];
+-    if (!next || next === current) return current;
+-    if (next in PROVIDER_ID_TO_ALIAS) return next;
+-    if (seen.has(next)) return next;
+-    seen.add(next);
+-    current = next;
+-  }
+-  return current;
+-}
++// Re-export the IMPORTED binding, not `export ... from` — the latter makes the name
++// available to importers but leaves it undefined inside this module, and there are 13
++// call sites below (parseModel, getModelInfoCore, resolveCanonicalProviderModel, ...).
++export { resolveProviderAlias };
+ 
+ /**
+  * #474 — Resolve a bare model name to the selected connection's `defaultModel`.
+diff --git a/open-sse/services/providerAlias.ts b/open-sse/services/providerAlias.ts
+new file mode 100644
+index 000000000..33a3009bf
+--- /dev/null
++++ b/open-sse/services/providerAlias.ts
+@@ -0,0 +1,92 @@
++// LOCAL PATCH 0012 — leaf module for provider-alias resolution.
++//
++// WHY THIS FILE EXISTS: `src/lib/combos/controlCenter.ts` is imported by the CLIENT
++// component `src/app/(dashboard)/dashboard/combos/ComboControlCenterClient.tsx`, and it
++// only ever needed `resolveProviderAlias` — a pure function over two lookup maps. But it
++// was importing that from `open-sse/services/model.ts`, which reaches the DB layer:
++//
++//   ComboControlCenterClient.tsx  [client]
++//     -> src/lib/combos/controlCenter.ts
++//       -> open-sse/services/model.ts
++//         -> src/lib/db/models/activeSyncedCatalog.ts -> db/providers.ts -> db/settings.ts
++//           -> src/lib/config/runtimeSettings.ts -> src/lib/tokenHealthCheck.ts
++//
++// That was harmless until v3.8.51: commit d351960be (#11488, "verify-only health sweep
++// for web-cookie connections", merged 2026-08-26 in a ~30-PR batch validated with
++// typecheck but NO build) added `tokenHealthCheck.ts -> tokenHealthCheckWebCookie.ts`,
++// which continues into the web-cookie validation graph and from there into `playwright`,
++// `sharp`, `ioredis` and `socks`. Turbopack then tried to bundle those for the BROWSER
++// and `next build` died on ~2100 unresolvable Node builtins (async_hooks, fs, net, tls,
++// dns, http2, inspector, module, readline). Every single browser-graph failure funnelled
++// through this one client component.
++//
++// The fix is to cut the edge at the top rather than give up the upstream feature — this
++// deploy depends on web-cookie providers (deepseek-web, gemini-web), so the health sweep
++// is worth keeping. Nothing here is rewritten: the map construction, every manual
++// override and the function body are moved VERBATIM from model.ts, which now imports
++// them back and re-exports `resolveProviderAlias` so all existing importers are
++// unaffected. Pure relocation, zero behaviour change.
++//
++// KEEP THIS MODULE LEAF. Its only import is the pure provider config. Adding anything
++// that reaches the DB, an executor, or a browser driver re-opens the whole graph.
++
++import { PROVIDER_ID_TO_ALIAS } from "../config/providerModels.ts";
++
++// Derive alias→provider mapping from the single source of truth (PROVIDER_ID_TO_ALIAS)
++// This prevents the two maps from drifting out of sync
++const ALIAS_TO_PROVIDER_ID: Record<string, string> = {};
++for (const [id, alias] of Object.entries(PROVIDER_ID_TO_ALIAS)) {
++  if (ALIAS_TO_PROVIDER_ID[alias]) {
++    console.log(
++      `[MODEL] Warning: alias "${alias}" maps to both "${ALIAS_TO_PROVIDER_ID[alias]}" and "${id}". Using "${id}".`
++    );
++  }
++  ALIAS_TO_PROVIDER_ID[alias] = id;
++}
++// Manual alias overrides — maps slug-style prefixes to canonical provider IDs.
++// These live outside the registry because they represent multiple providers
++// or backward-compatible slug changes, not a single provider's display name.
++// opencode/ → opencode-zen (the main free/open tier; opencode-go is a separate paid tier)
++ALIAS_TO_PROVIDER_ID["opencode"] = "opencode-zen";
++// xiaomi/ is the user-visible prefix for MiMo models; register it so
++// parseModel("xiaomi/mimo-v2-flash") resolves provider = "xiaomi-mimo" instead
++// of falling through to the identity fallback ("xiaomi").
++ALIAS_TO_PROVIDER_ID["xiaomi"] = "xiaomi-mimo";
++// llamacpp/ is the user-visible alias for the llama-cpp self-hosted provider.
++// The canonical ID is "llama-cpp" (with a hyphen), but the catalog and user-facing
++// prefix is "llamacpp". Register it so parseModel("llamacpp/<model>") resolves
++// provider = "llama-cpp" instead of the identity fallback ("llamacpp").
++ALIAS_TO_PROVIDER_ID["llamacpp"] = "llama-cpp";
++// agy/ is the short alias for antigravity provider.
++ALIAS_TO_PROVIDER_ID["agy"] = "antigravity";
++// aq/ is the user-visible prefix for the Amazon Q (AWS Builder ID) provider.
++// The canonical provider ID is "amazon-q". Register it so parseModel("aq/<model>")
++// resolves provider = "amazon-q" instead of falling through to the identity fallback.
++ALIAS_TO_PROVIDER_ID["aq"] = "amazon-q";
++
++export { ALIAS_TO_PROVIDER_ID };
++
++/**
++ * Resolve provider alias to provider ID
++ */
++export function resolveProviderAlias(aliasOrId: string | null | undefined): string | null {
++  if (typeof aliasOrId !== "string") return null;
++  // Follow the alias chain transitively so intermediate alias-only hops resolve
++  // to the final target, but STOP as soon as a hop lands on a registered
++  // provider id (#2901): "oc" must resolve to the no-auth "opencode" provider,
++  // NOT continue through the manual "opencode" → "opencode-zen" slug override —
++  // that override is for user-typed `opencode/` prefixes only. Without this
++  // boundary the no-auth provider becomes unreachable by any prefix.
++  // Guarded against infinite loops with both a depth limit and a seen-set.
++  let current = aliasOrId;
++  const seen = new Set<string>();
++  for (let i = 0; i < 10; i++) {
++    const next = ALIAS_TO_PROVIDER_ID[current];
++    if (!next || next === current) return current;
++    if (next in PROVIDER_ID_TO_ALIAS) return next;
++    if (seen.has(next)) return next;
++    seen.add(next);
++    current = next;
++  }
++  return current;
++}
+diff --git a/src/lib/combos/controlCenter.ts b/src/lib/combos/controlCenter.ts
+index 92a87b273..7ec3a8a9a 100644
+--- a/src/lib/combos/controlCenter.ts
++++ b/src/lib/combos/controlCenter.ts
+@@ -1,6 +1,10 @@
+ import { normalizeComboModels, type ComboStep } from "./steps";
+ import { resolveComboTargetModelStr } from "../../../open-sse/services/combo/opencodeTargetAlias.ts";
+-import { resolveProviderAlias } from "../../../open-sse/services/model.ts";
++// LOCAL PATCH 0012 — was "…/services/model.ts". This file is imported by the CLIENT
++// component ComboControlCenterClient.tsx, and model.ts reaches the DB layer and from
++// v3.8.51 onward into playwright/sharp, which breaks the browser bundle. The leaf module
++// exposes the same function. See open-sse/services/providerAlias.ts.
++import { resolveProviderAlias } from "../../../open-sse/services/providerAlias.ts";
+ 
+ type JsonRecord = Record<string, unknown>;
+ 

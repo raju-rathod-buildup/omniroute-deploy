@@ -1,0 +1,605 @@
+diff --git a/src/hooks/useLiveDashboard.ts b/src/hooks/useLiveDashboard.ts
+index d6e5ce766..f1e5139e5 100644
+--- a/src/hooks/useLiveDashboard.ts
++++ b/src/hooks/useLiveDashboard.ts
+@@ -19,6 +19,17 @@ import { deriveLiveWsPath, resolveLiveWsUrl, sanitizeLiveWsPort } from "@/shared
+ 
+ const WS_RECONNECT_DELAYS = [1000, 2000, 4000, 8000, 16000, 30000];
+ 
++// A connection must stay open this long before the backoff resets. Resetting on
++// every `open` let a flapping server (open → drop within seconds) pin the retry
++// delay at the first step forever, so a stalled server was hammered by every
++// open dashboard tab with a reconnect each second.
++const WS_STABLE_CONNECTION_MS = 10_000;
++
++/** ±20% jitter so tabs that dropped together do not reconnect in lockstep. */
++function withJitter(delayMs: number): number {
++  return Math.round(delayMs * (0.8 + Math.random() * 0.4));
++}
++
+ // Must stay <= the server's HEARTBEAT_TIMEOUT_MS (35s in src/server/ws/liveServer.ts) so a
+ // healthy, connected-but-idle client is never force-terminated by the server's heartbeat sweep.
+ // Matches the server's own HEARTBEAT_INTERVAL_MS (15s).
+@@ -154,6 +165,20 @@ export function useLiveDashboard({
+   const reconnectTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+   const pingIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+   const mountedRef = useRef(true);
++  // Backoff position lives in a ref, NOT in state read by `connect`: when it was
++  // state in `connect`'s deps, resetting it on a successful open changed
++  // `connect`'s identity, re-ran the effect that owns the socket, and tore down
++  // the connection that had just opened (an open/close loop after any drop).
++  const reconnectAttemptRef = useRef(0);
++  const stableTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
++  const connectRef = useRef<() => void>(() => {});
++
++  const clearStableTimer = useCallback(() => {
++    if (stableTimerRef.current) {
++      clearTimeout(stableTimerRef.current);
++      stableTimerRef.current = null;
++    }
++  }, []);
+ 
+   const stopPingHeartbeat = useCallback(() => {
+     if (pingIntervalRef.current) {
+@@ -195,13 +220,23 @@ export function useLiveDashboard({
+       wsRef.current = ws;
+ 
+       ws.onopen = () => {
+-        if (!mountedRef.current) return;
+-        setConnection({
++        if (!mountedRef.current || wsRef.current !== ws) return;
++        // Only forget the backoff once the connection has proven stable; a
++        // socket that opens and drops straight away must keep escalating.
++        clearStableTimer();
++        stableTimerRef.current = setTimeout(() => {
++          stableTimerRef.current = null;
++          reconnectAttemptRef.current = 0;
++          setConnection((prev) =>
++            prev.reconnectAttempt === 0 ? prev : { ...prev, reconnectAttempt: 0 }
++          );
++        }, WS_STABLE_CONNECTION_MS);
++        setConnection((prev) => ({
+           isConnected: true,
+           isConnecting: false,
+           error: null,
+-          reconnectAttempt: 0,
+-        });
++          reconnectAttempt: prev.reconnectAttempt,
++        }));
+ 
+         // Subscribe to channels
+         ws.send(JSON.stringify({ type: "subscribe", channels: stableChannels }));
+@@ -262,7 +297,12 @@ export function useLiveDashboard({
+       };
+ 
+       ws.onclose = () => {
++        // A socket that was already replaced (effect re-run, manual reconnect)
++        // still fires `close` asynchronously; it must not stop the live socket's
++        // heartbeat or schedule a second reconnect.
++        if (wsRef.current !== ws) return;
+         stopPingHeartbeat();
++        clearStableTimer();
+         if (!mountedRef.current) return;
+         wsRef.current = null;
+         setConnection((prev) => ({
+@@ -272,13 +312,16 @@ export function useLiveDashboard({
+         }));
+ 
+         if (autoReconnect) {
+-          const attempt = connection.reconnectAttempt;
+-          const delay = WS_RECONNECT_DELAYS[Math.min(attempt, WS_RECONNECT_DELAYS.length - 1)];
++          const attempt = reconnectAttemptRef.current;
++          const delay = withJitter(
++            WS_RECONNECT_DELAYS[Math.min(attempt, WS_RECONNECT_DELAYS.length - 1)]
++          );
++          reconnectAttemptRef.current = attempt + 1;
++          setConnection((prev) => ({ ...prev, reconnectAttempt: attempt + 1 }));
++          if (reconnectTimeoutRef.current) clearTimeout(reconnectTimeoutRef.current);
+           reconnectTimeoutRef.current = setTimeout(() => {
+-            setConnection((prev) => ({
+-              ...prev,
+-              reconnectAttempt: prev.reconnectAttempt + 1,
+-            }));
++            reconnectTimeoutRef.current = null;
++            connectRef.current();
+           }, delay);
+         }
+       };
+@@ -298,14 +341,12 @@ export function useLiveDashboard({
+         error: err instanceof Error ? err.message : "Connection failed",
+       }));
+     }
+-  }, [
+-    effectiveWsUrl,
+-    apiKey,
+-    stableChannels,
+-    autoReconnect,
+-    connection.reconnectAttempt,
+-    stopPingHeartbeat,
+-  ]);
++  }, [effectiveWsUrl, apiKey, stableChannels, autoReconnect, stopPingHeartbeat, clearStableTimer]);
++
++  // Timer callbacks always call the latest `connect` without it being a dep.
++  useEffect(() => {
++    connectRef.current = connect;
++  }, [connect]);
+ 
+   // Connect on mount and on reconnect trigger
+   useEffect(() => {
+@@ -336,20 +377,46 @@ export function useLiveDashboard({
+       mountedRef.current = false;
+       if (reconnectTimeoutRef.current) {
+         clearTimeout(reconnectTimeoutRef.current);
++        reconnectTimeoutRef.current = null;
+       }
+       stopPingHeartbeat();
+-      wsRef.current?.close();
++      clearStableTimer();
++      // Detach before closing: browsers fire `close` asynchronously, by which
++      // time this effect may have re-run (mountedRef true again) and a late
++      // handler would otherwise schedule a reconnect duplicating the new socket.
++      const ws = wsRef.current;
++      wsRef.current = null;
++      if (ws) {
++        ws.onopen = null;
++        ws.onmessage = null;
++        ws.onerror = null;
++        ws.onclose = null;
++        ws.close();
++      }
+     };
+-  }, [connect, enabled, wsUrlResolved, stopPingHeartbeat]);
++  }, [connect, enabled, wsUrlResolved, stopPingHeartbeat, clearStableTimer]);
+ 
+   // Connect (for manual retry)
+   const reconnect = useCallback(() => {
+-    wsRef.current?.close();
+-    setConnection((prev) => ({
+-      ...prev,
+-      reconnectAttempt: prev.reconnectAttempt + 1,
+-    }));
+-  }, []);
++    if (reconnectTimeoutRef.current) {
++      clearTimeout(reconnectTimeoutRef.current);
++      reconnectTimeoutRef.current = null;
++    }
++    clearStableTimer();
++    stopPingHeartbeat();
++    reconnectAttemptRef.current = 0;
++    setConnection((prev) => ({ ...prev, reconnectAttempt: 0 }));
++    const ws = wsRef.current;
++    wsRef.current = null;
++    if (ws) {
++      ws.onopen = null;
++      ws.onmessage = null;
++      ws.onerror = null;
++      ws.onclose = null;
++      ws.close();
++    }
++    connectRef.current();
++  }, [clearStableTimer, stopPingHeartbeat]);
+ 
+   return {
+     connection,
+diff --git a/src/shared/components/MaintenanceBanner.tsx b/src/shared/components/MaintenanceBanner.tsx
+index 08d9c430e..c5877c201 100644
+--- a/src/shared/components/MaintenanceBanner.tsx
++++ b/src/shared/components/MaintenanceBanner.tsx
+@@ -12,17 +12,31 @@ import { useState, useEffect } from "react";
+ import { useRef } from "react";
+ import { useTranslations } from "next-intl";
+ 
++// The probe is a synchronous SELECT 1 on Node's event loop, so a stall (host
++// swap/CPU pressure, a long GC) delays it without the server being down. 8s x 2
++// failures flashed "Server is unreachable" while users were still being served.
++const PROBE_TIMEOUT_MS = 20_000;
++const FAILURES_BEFORE_BANNER = 3;
++
+ export default function MaintenanceBanner() {
+   const [show, setShow] = useState(false);
+   const [message, setMessage] = useState("");
+   const consecutiveFailuresRef = useRef(0);
+   const dismissedUntilRecoveryRef = useRef(false);
++  const inFlightRef = useRef(false);
+   const t = useTranslations("common");
+ 
+   useEffect(() => {
+     const checkHealth = async () => {
++      // The timeout now exceeds the 10s poll interval; never stack probes on a
++      // server that is already slow, and keep failure counts in order.
++      if (inFlightRef.current) return;
++      inFlightRef.current = true;
+       const controller = new AbortController();
+-      const timeoutId = setTimeout(() => controller.abort("Health check timeout"), 8000);
++      const timeoutId = setTimeout(
++        () => controller.abort("Health check timeout"),
++        PROBE_TIMEOUT_MS
++      );
+       try {
+         // Use lightweight liveness probe (single SELECT 1) instead of the
+         // heavy /api/monitoring/health observability endpoint. The heavy
+@@ -39,20 +53,27 @@ export default function MaintenanceBanner() {
+           setMessage("");
+         } else {
+           consecutiveFailuresRef.current += 1;
+-          // Require at least 2 failed checks to avoid transient false positives.
+-          if (consecutiveFailuresRef.current >= 2 && !dismissedUntilRecoveryRef.current) {
++          // Require several failed checks to avoid transient false positives.
++          if (
++            consecutiveFailuresRef.current >= FAILURES_BEFORE_BANNER &&
++            !dismissedUntilRecoveryRef.current
++          ) {
+             setShow(true);
+             setMessage(t("maintenanceServerIssues"));
+           }
+         }
+       } catch {
+         consecutiveFailuresRef.current += 1;
+-        if (consecutiveFailuresRef.current >= 2 && !dismissedUntilRecoveryRef.current) {
++        if (
++          consecutiveFailuresRef.current >= FAILURES_BEFORE_BANNER &&
++          !dismissedUntilRecoveryRef.current
++        ) {
+           setShow(true);
+           setMessage(t("maintenanceServerUnreachable"));
+         }
+       } finally {
+         clearTimeout(timeoutId);
++        inFlightRef.current = false;
+       }
+     };
+ 
+diff --git a/tests/unit/maintenance-banner-threshold.test.tsx b/tests/unit/maintenance-banner-threshold.test.tsx
+new file mode 100644
+index 000000000..bb5e262a4
+--- /dev/null
++++ b/tests/unit/maintenance-banner-threshold.test.tsx
+@@ -0,0 +1,110 @@
++// @vitest-environment jsdom
++//
++// Regression guard for false "Server is unreachable. Reconnecting..." banners.
++//
++// The probe is a synchronous SELECT 1 on Node's event loop, so a stall (host
++// swap/CPU pressure, a long GC) delays it for seconds without the server being
++// down. Two consecutive 8s timeouts (observed 12 Oct 2026, 10s apart) were
++// enough to flash the banner while two users were actively being served. The
++// banner now needs three consecutive failures and allows 20s per probe.
++import React, { act } from "react";
++import { createRoot } from "react-dom/client";
++import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
++
++vi.mock("next-intl", () => ({
++  useTranslations: () => (key: string) => key,
++}));
++
++import MaintenanceBanner from "../../src/shared/components/MaintenanceBanner";
++
++const INTERVAL_MS = 10_000;
++
++function mount() {
++  const container = document.createElement("div");
++  document.body.appendChild(container);
++  const root = createRoot(container);
++  act(() => {
++    root.render(<MaintenanceBanner />);
++  });
++  return { container, unmount: () => act(() => root.unmount()) };
++}
++
++/** Let the in-flight check settle, then advance to the next 10s tick. */
++async function tick(ms = INTERVAL_MS) {
++  await act(async () => {
++    await vi.advanceTimersByTimeAsync(ms);
++  });
++}
++
++describe("MaintenanceBanner failure threshold", () => {
++  beforeEach(() => {
++    (
++      globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }
++    ).IS_REACT_ACT_ENVIRONMENT = true;
++    vi.useFakeTimers();
++  });
++
++  afterEach(() => {
++    document.body.innerHTML = "";
++    vi.useRealTimers();
++    vi.unstubAllGlobals();
++  });
++
++  it("stays hidden after two consecutive failed probes", async () => {
++    vi.stubGlobal(
++      "fetch",
++      vi.fn(() => Promise.reject(new TypeError("Failed to fetch")))
++    );
++    const { container, unmount } = mount();
++    await tick(0); // immediate probe on mount: failure #1
++    await tick(); // failure #2
++    expect(container.textContent).not.toContain("maintenanceServerUnreachable");
++    unmount();
++  });
++
++  it("shows the banner after three consecutive failed probes", async () => {
++    vi.stubGlobal(
++      "fetch",
++      vi.fn(() => Promise.reject(new TypeError("Failed to fetch")))
++    );
++    const { container, unmount } = mount();
++    await tick(0);
++    await tick();
++    await tick(); // failure #3
++    expect(container.textContent).toContain("maintenanceServerUnreachable");
++    unmount();
++  });
++
++  it("tolerates a slow probe: a 12s response is a success, not a timeout", async () => {
++    const fetchMock = vi.fn(
++      (_url: string, init?: { signal?: AbortSignal }) =>
++        new Promise<{ ok: boolean }>((resolve, reject) => {
++          init?.signal?.addEventListener("abort", () => reject(new Error("aborted")));
++          setTimeout(() => resolve({ ok: true }), 12_000);
++        })
++    );
++    vi.stubGlobal("fetch", fetchMock);
++    const { container, unmount } = mount();
++    // Run well past several probe cycles; every probe takes 12s (> old 8s limit).
++    for (let i = 0; i < 6; i++) await tick();
++    expect(container.textContent).not.toContain("maintenanceServerUnreachable");
++    unmount();
++  });
++
++  it("clears the banner once a probe succeeds again", async () => {
++    let ok = false;
++    vi.stubGlobal(
++      "fetch",
++      vi.fn(() => (ok ? Promise.resolve({ ok: true }) : Promise.reject(new TypeError("x"))))
++    );
++    const { container, unmount } = mount();
++    await tick(0);
++    await tick();
++    await tick();
++    expect(container.textContent).toContain("maintenanceServerUnreachable");
++    ok = true;
++    await tick();
++    expect(container.textContent).not.toContain("maintenanceServerUnreachable");
++    unmount();
++  });
++});
+diff --git a/tests/unit/useLiveDashboard-reconnect.test.tsx b/tests/unit/useLiveDashboard-reconnect.test.tsx
+new file mode 100644
+index 000000000..69c53d645
+--- /dev/null
++++ b/tests/unit/useLiveDashboard-reconnect.test.tsx
+@@ -0,0 +1,232 @@
++// @vitest-environment jsdom
++//
++// Regression guard for the live-WS reconnect storm seen on 12 Oct 2026 (one
++// browser opened ~20 sockets/min instead of ~3/hour, each torn down after ~17s).
++//
++// Root cause in useLiveDashboard: `connect` listed `connection.reconnectAttempt`
++// in its deps and `onopen` reset that counter to 0. After ANY reconnect the
++// successful open therefore changed `connect`'s identity, which re-ran the
++// effect that owns the socket: its cleanup closed the socket that had just
++// opened and the effect opened another — and because every open reset the
++// backoff to 0, the retry delay never grew. One dropped connection became a
++// self-sustaining open/close loop that hammered the server exactly when it was
++// already stalling.
++import React, { act } from "react";
++import { createRoot } from "react-dom/client";
++import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
++import { useLiveDashboard } from "../../src/hooks/useLiveDashboard";
++
++class MockWebSocket {
++  static readonly CONNECTING = 0;
++  static readonly OPEN = 1;
++  static readonly CLOSING = 2;
++  static readonly CLOSED = 3;
++  static instances: MockWebSocket[] = [];
++  /** Real browsers fire `close` asynchronously after `.close()`; model that. */
++  static deferClose = false;
++
++  readyState = MockWebSocket.CONNECTING;
++  sent: string[] = [];
++  onopen: (() => void) | null = null;
++  onmessage: ((event: { data: string }) => void) | null = null;
++  onclose: (() => void) | null = null;
++  onerror: (() => void) | null = null;
++
++  constructor(public url: string) {
++    MockWebSocket.instances.push(this);
++  }
++
++  send(data: string): void {
++    this.sent.push(data);
++  }
++
++  close(): void {
++    if (this.readyState === MockWebSocket.CLOSED) return;
++    this.readyState = MockWebSocket.CLOSED;
++    if (MockWebSocket.deferClose) {
++      setTimeout(() => this.onclose?.(), 0);
++    } else {
++      this.onclose?.();
++    }
++  }
++
++  triggerOpen(): void {
++    this.readyState = MockWebSocket.OPEN;
++    this.onopen?.();
++  }
++
++  /** The server (or network) drops the connection. */
++  triggerServerClose(): void {
++    this.readyState = MockWebSocket.CLOSED;
++    this.onclose?.();
++  }
++}
++
++const cleanupCallbacks: Array<() => void> = [];
++
++function makeContainer(): HTMLElement {
++  const container = document.createElement("div");
++  document.body.appendChild(container);
++  cleanupCallbacks.push(() => container.remove());
++  return container;
++}
++
++function mountHook(channels: string[] = ["requests"]) {
++  const root = createRoot(makeContainer());
++  function C({ ch }: { ch: string[] }) {
++    useLiveDashboard({
++      wsUrl: "ws://localhost:20132/live-ws",
++      channels: ch as never,
++    });
++    return null;
++  }
++  act(() => {
++    root.render(<C ch={channels} />);
++  });
++  return {
++    rerender: (ch: string[]) =>
++      act(() => {
++        root.render(<C ch={ch} />);
++      }),
++    unmount: () =>
++      act(() => {
++        root.unmount();
++      }),
++  };
++}
++
++const last = () => MockWebSocket.instances[MockWebSocket.instances.length - 1];
++
++describe("useLiveDashboard reconnect behaviour", () => {
++  beforeEach(() => {
++    (
++      globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }
++    ).IS_REACT_ACT_ENVIRONMENT = true;
++    MockWebSocket.instances = [];
++    MockWebSocket.deferClose = false;
++    vi.stubGlobal("WebSocket", MockWebSocket);
++    vi.useFakeTimers();
++    // Pin jitter to its midpoint so delays are exactly the table values.
++    vi.spyOn(Math, "random").mockReturnValue(0.5);
++  });
++
++  afterEach(() => {
++    while (cleanupCallbacks.length > 0) {
++      cleanupCallbacks.pop()?.();
++    }
++    document.body.innerHTML = "";
++    vi.useRealTimers();
++    vi.restoreAllMocks();
++    vi.unstubAllGlobals();
++  });
++
++  it("keeps a reconnected socket open instead of tearing it down and reopening", () => {
++    mountHook();
++    expect(MockWebSocket.instances).toHaveLength(1);
++
++    act(() => MockWebSocket.instances[0].triggerOpen());
++    act(() => MockWebSocket.instances[0].triggerServerClose());
++
++    // First backoff step is 1s.
++    act(() => {
++      vi.advanceTimersByTime(1_000);
++    });
++    expect(MockWebSocket.instances).toHaveLength(2);
++
++    act(() => MockWebSocket.instances[1].triggerOpen());
++    // Let any effect re-run / timers settle. Before the fix the successful
++    // open changed `connect`'s identity here, closing socket #2 and opening #3.
++    act(() => {
++      vi.advanceTimersByTime(5_000);
++    });
++
++    expect(MockWebSocket.instances).toHaveLength(2);
++    expect(MockWebSocket.instances[1].readyState).toBe(MockWebSocket.OPEN);
++  });
++
++  it("grows the backoff when connections keep dropping right after opening", () => {
++    mountHook();
++
++    // Socket 1 opens and dies immediately.
++    act(() => last().triggerOpen());
++    act(() => last().triggerServerClose());
++
++    const expectedDelays = [1_000, 2_000, 4_000, 8_000];
++    for (const [i, delay] of expectedDelays.entries()) {
++      const before = MockWebSocket.instances.length;
++      // One tick short of the delay: no new socket yet.
++      act(() => {
++        vi.advanceTimersByTime(delay - 1);
++      });
++      expect(MockWebSocket.instances, `delay #${i} fired early`).toHaveLength(before);
++      act(() => {
++        vi.advanceTimersByTime(1);
++      });
++      expect(MockWebSocket.instances, `delay #${i} did not fire`).toHaveLength(before + 1);
++
++      // The new socket opens and drops again straight away (flapping server).
++      act(() => last().triggerOpen());
++      act(() => last().triggerServerClose());
++    }
++  });
++
++  it("resets the backoff once a connection has stayed up long enough", () => {
++    mountHook();
++    act(() => last().triggerOpen());
++    act(() => last().triggerServerClose());
++    act(() => {
++      vi.advanceTimersByTime(1_000);
++    });
++    act(() => last().triggerOpen());
++    act(() => last().triggerServerClose());
++    act(() => {
++      vi.advanceTimersByTime(2_000);
++    });
++    expect(MockWebSocket.instances).toHaveLength(3);
++
++    // This one is healthy for a full minute...
++    act(() => last().triggerOpen());
++    act(() => {
++      vi.advanceTimersByTime(60_000);
++    });
++    act(() => last().triggerServerClose());
++
++    // ...so the next retry is back to the first step (1s), not 4s.
++    const before = MockWebSocket.instances.length;
++    act(() => {
++      vi.advanceTimersByTime(1_000);
++    });
++    expect(MockWebSocket.instances).toHaveLength(before + 1);
++  });
++
++  it("does not reconnect from a stale socket's late close event after the effect re-runs", () => {
++    MockWebSocket.deferClose = true;
++    const { rerender } = mountHook(["requests"]);
++    act(() => MockWebSocket.instances[0].triggerOpen());
++
++    // Changing channels re-runs the connect effect: socket 0 is closed (its
++    // `close` event arrives asynchronously, like a real browser) and socket 1
++    // is opened.
++    rerender(["requests", "combo"]);
++    expect(MockWebSocket.instances).toHaveLength(2);
++    act(() => MockWebSocket.instances[1].triggerOpen());
++
++    // Socket 0's late close must not schedule a reconnect that duplicates socket 1.
++    act(() => {
++      vi.advanceTimersByTime(10_000);
++    });
++    expect(MockWebSocket.instances).toHaveLength(2);
++    expect(MockWebSocket.instances[1].readyState).toBe(MockWebSocket.OPEN);
++  });
++
++  it("does not reconnect after unmount", () => {
++    MockWebSocket.deferClose = true;
++    const { unmount } = mountHook();
++    act(() => MockWebSocket.instances[0].triggerOpen());
++    unmount();
++    act(() => {
++      vi.advanceTimersByTime(60_000);
++    });
++    expect(MockWebSocket.instances).toHaveLength(1);
++  });
++});

@@ -1,0 +1,73 @@
+diff --git a/open-sse/config/providers/registry/codebuddy-cn/index.ts b/open-sse/config/providers/registry/codebuddy-cn/index.ts
+index ae951828d..870c332ea 100644
+--- a/open-sse/config/providers/registry/codebuddy-cn/index.ts
++++ b/open-sse/config/providers/registry/codebuddy-cn/index.ts
+@@ -1,4 +1,6 @@
+-import { CODEBUDDY_CN_USER_AGENT } from "@/lib/oauth/constants/oauth";
++// LOCAL PATCH 0013 — was "@/lib/oauth/constants/oauth", which reaches node:fs and
++// tainted the whole provider registry for the browser bundle. Same constant, leaf module.
++import { CODEBUDDY_CN_USER_AGENT } from "@/lib/oauth/constants/codebuddyUserAgent";
+ import type { RegistryEntry } from "../../shared.ts";
+ 
+ /**
+diff --git a/src/lib/oauth/constants/codebuddyUserAgent.ts b/src/lib/oauth/constants/codebuddyUserAgent.ts
+new file mode 100644
+index 000000000..20b70e2c6
+--- /dev/null
++++ b/src/lib/oauth/constants/codebuddyUserAgent.ts
+@@ -0,0 +1,32 @@
++// LOCAL PATCH 0013 — leaf module holding one string constant.
++//
++// WHY: v3.8.51 commit 8c5eff1bb ("fix(oauth): align codebuddy-cn OAuth User-Agent with
++// chat/usage", #12702/#13264) made the codebuddy-cn PROVIDER REGISTRY ENTRY import this
++// constant from ./oauth.ts. That file imports CURSOR_AGENT_CLI_VERSION from
++// open-sse/utils/cursorAgentCliVersion.ts, which reads the filesystem (node:fs/os/path).
++//
++// One import line therefore tainted the entire provider registry:
++//
++//   registry/codebuddy-cn/index.ts -> lib/oauth/constants/oauth.ts
++//     -> open-sse/utils/cursorAgentCliVersion.ts -> node:fs
++//
++// and the registry is the root of open-sse/config/providers/index.ts ->
++// providerRegistry.ts -> providerModels.ts -> src/shared/constants/models.ts, which 333
++// of the 768 "use client" boundaries import. That is the bulk of the jump from 41 tainted
++// client boundaries on v3.8.50 to 358 on v3.8.51, and why `next build` could not produce
++// a browser bundle (Turbopack: "the chunking context does not support external modules
++// (request: node:fs)"; webpack: UnhandledSchemeError on the node: scheme).
++//
++// The constant is a plain string, so it does not belong behind that graph. oauth.ts
++// re-exports it below, so every existing importer is unaffected and the "single source of
++// truth" the oauth.ts comment demands across OAuth / chat / usage still holds.
++//
++// KEEP THIS FILE IMPORT-FREE.
++
++// CODEBUDDY_CN_USER_AGENT is the single source of truth for the CLI/CodeBuddy version
++// string. It MUST stay identical across OAuth (./oauth.ts), chat completions
++// (open-sse/config/providers/registry/codebuddy-cn/index.ts) and usage/quota
++// (open-sse/services/usage/codebuddy-cn.ts) — a mismatched version string across a
++// single account's auth vs. chat calls is exactly the kind of internally-inconsistent
++// client fingerprint Tencent's WAF flags as anomalous (#12702).
++export const CODEBUDDY_CN_USER_AGENT = "CLI/2.108.1 CodeBuddy/2.108.1";
+diff --git a/src/lib/oauth/constants/oauth.ts b/src/lib/oauth/constants/oauth.ts
+index 8094bb58c..b8d341301 100644
+--- a/src/lib/oauth/constants/oauth.ts
++++ b/src/lib/oauth/constants/oauth.ts
+@@ -107,13 +107,11 @@ export const QODER_CONFIG = {
+ // (Custom Device-Auth Flow: POST stateUrl → open authUrl → GET pollUrl?state=).
+ // No client_id/secret — the upstream CLI ships none.
+ //
+-// CODEBUDDY_CN_USER_AGENT is the single source of truth for the CLI/CodeBuddy version
+-// string. It MUST stay identical across OAuth (this file), chat completions
+-// (open-sse/config/providers/registry/codebuddy-cn/index.ts) and usage/quota
+-// (open-sse/services/usage/codebuddy-cn.ts) — a mismatched version string across a
+-// single account's auth vs. chat calls is exactly the kind of internally-inconsistent
+-// client fingerprint Tencent's WAF flags as anomalous (#12702).
+-export const CODEBUDDY_CN_USER_AGENT = "CLI/2.108.1 CodeBuddy/2.108.1";
++// LOCAL PATCH 0013 — moved to ./codebuddyUserAgent.ts (a leaf) so the provider registry
++// can read it without pulling this module's filesystem graph into the browser bundle.
++// Re-exported here so every existing importer of oauth.ts keeps working.
++export { CODEBUDDY_CN_USER_AGENT } from "./codebuddyUserAgent";
++import { CODEBUDDY_CN_USER_AGENT } from "./codebuddyUserAgent";
+ 
+ export const CODEBUDDY_CN_CONFIG = {
+   baseUrl: "https://copilot.tencent.com",

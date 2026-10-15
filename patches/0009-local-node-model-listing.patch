@@ -1,0 +1,47 @@
+diff --git a/src/lib/memory/embedding/index.ts b/src/lib/memory/embedding/index.ts
+index 2713847..1006e4a 100644
+--- a/src/lib/memory/embedding/index.ts
++++ b/src/lib/memory/embedding/index.ts
+@@ -280,12 +280,41 @@ export async function listEmbeddingProviders(): Promise<EmbeddingProviderListing
+   }
+ 
+   // Process dynamic providers (local nodes)
++  //
++  // buildDynamicEmbeddingProvider() returns `models: []` unconditionally — it has
++  // no way to know what a local node serves. The dashboard renders this listing as
++  // `providers.map(p => p.models.map(...))`, so a local node contributed ZERO
++  // options and was invisible in the embedding/rerank pickers even when configured
++  // and working. Worse, the stored value then matched no <option>, so touching the
++  // control would silently overwrite a working local config with a cloud model.
++  //
++  // Ask the node what it serves. Best-effort with a short timeout: a node that is
++  // down, slow, or does not implement /models simply contributes no options, which
++  // is exactly the previous behaviour — this can only add entries, never break the
++  // listing.
+   for (const dp of dynamicProviders) {
++    let models = dp.models;
++    if (models.length === 0) {
++      try {
++        const modelsUrl = dp.baseUrl.replace(/\/(embeddings|rerank)$/, "") + "/models";
++        const res = await fetch(modelsUrl, { signal: AbortSignal.timeout(2000) });
++        if (res.ok) {
++          const payload = (await res.json()) as { data?: Array<{ id?: unknown; name?: unknown }> };
++          if (Array.isArray(payload?.data)) {
++            models = payload.data
++              .filter((m) => typeof m?.id === "string" && m.id.length > 0)
++              .map((m) => ({ id: String(m.id), name: String(m.name ?? m.id) }));
++          }
++        }
++      } catch {
++        // Node unreachable or has no /models — leave the list empty.
++      }
++    }
+     // Dynamic local providers typically have authType="none"
+     result.push({
+       provider: dp.id,
+       hasKey: true, // local providers don't need keys
+-      models: dp.models.map((m) => ({
++      models: models.map((m) => ({
+         id: `${dp.id}/${m.id}`,
+         name: m.name,
+         dimensions: m.dimensions ?? null,

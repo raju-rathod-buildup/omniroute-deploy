@@ -1,0 +1,36 @@
+diff --git a/src/shared/utils/basePath.ts b/src/shared/utils/basePath.ts
+index 80d012e..e80c69c 100644
+--- a/src/shared/utils/basePath.ts
++++ b/src/shared/utils/basePath.ts
+@@ -14,6 +14,22 @@ export function normalizeBasePath(value?: string | null): string {
+   return withSlash.replace(/\/+$/, "");
+ }
+ 
++/**
++ * Build-time literal.
++ *
++ * `process.env.X` spelled out in full is the ONLY form the bundler can replace
++ * statically. The indirect `env.X` reads below survive into the client bundle as
++ * property lookups against a browser `process.env` shim that carries no
++ * NEXT_PUBLIC_* values, so on the client they both evaluate to undefined.
++ *
++ * Without this fallback getDeployBasePath() returns "" in the browser,
++ * installBasePathFetch() bails out at its `if (!basePath)` guard, and every
++ * client-side fetch/EventSource is issued against the origin root instead of the
++ * deploy subpath — which 404s behind a reverse proxy and surfaces as the
++ * "Server is experiencing issues" banner.
++ */
++const BUNDLED_BASE_PATH = process.env.NEXT_PUBLIC_OMNIROUTE_BASE_PATH || "";
++
+ /**
+  * Deploy basePath as seen by the client bundle.
+  * Set via next.config `env.NEXT_PUBLIC_OMNIROUTE_BASE_PATH` from `OMNIROUTE_BASE_PATH`.
+@@ -22,7 +38,7 @@ export function getDeployBasePath(
+   env: NodeJS.ProcessEnv = typeof process !== "undefined" ? process.env : ({} as NodeJS.ProcessEnv)
+ ): string {
+   return normalizeBasePath(
+-    env.NEXT_PUBLIC_OMNIROUTE_BASE_PATH || env.OMNIROUTE_BASE_PATH || ""
++    env.NEXT_PUBLIC_OMNIROUTE_BASE_PATH || env.OMNIROUTE_BASE_PATH || BUNDLED_BASE_PATH
+   );
+ }
+ 

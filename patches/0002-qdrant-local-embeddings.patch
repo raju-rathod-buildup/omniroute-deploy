@@ -1,0 +1,52 @@
+diff --git a/src/lib/memory/qdrant.ts b/src/lib/memory/qdrant.ts
+index 8178bfb..8a82fe1 100644
+--- a/src/lib/memory/qdrant.ts
++++ b/src/lib/memory/qdrant.ts
+@@ -1,5 +1,7 @@
+ import { getSettings } from "@/lib/db/settings";
+ import { createEmbeddingResponse } from "@/lib/embeddings/service";
++import { embed } from "./embedding";
++import { getMemorySettings } from "./settings";
+ 
+ type JsonRecord = Record<string, unknown>;
+ 
+@@ -249,6 +251,39 @@ async function getCollectionVectorName(cfg: QdrantConfig): Promise<string | null
+ }
+ 
+ async function embedText(cfg: QdrantConfig, text: string): Promise<number[]> {
++  // ── LOCAL PATCH 0002 ──────────────────────────────────────────────────────
++  // Upstream always embeds through the provider dispatch path below, which forces
++  // a billed API call (default `openai/text-embedding-3-small`) and ships memory
++  // text off-box — even when the memory engine is explicitly configured for local
++  // embeddings. That makes "enable Qdrant" silently change the cost and privacy
++  // properties of the whole memory subsystem.
++  //
++  // When the memory engine resolves to a LOCAL source, embed with the engine's own
++  // embed() (the same function that fills sqlite-vec) so Qdrant honours
++  // `embeddingSource`. Remote stays on the untouched upstream path below, so this
++  // is a no-op for provider-backed deployments.
++  //
++  // Dimensions take care of themselves: callers pass vector.length to
++  // ensureCollection(), so a 384-dim local model creates a 384-dim collection.
++  const memorySettings = await getMemorySettings();
++  if (
++    memorySettings.embeddingSource === "transformers" ||
++    memorySettings.embeddingSource === "static"
++  ) {
++    const local = await embed(text, memorySettings);
++    // embed() returns a Float32Array; JSON.stringify serialises that as an OBJECT
++    // ({"0":..,"1":..}), which Qdrant rejects with "data did not match any variant
++    // of untagged enum VectorStruct". Upstream's provider path returns number[],
++    // so this only bites the local path. Convert explicitly.
++    if ("vector" in local) return Array.from(local.vector);
++    // Fail loudly rather than silently falling back to a billed provider call.
++    throw new Error(
++      `Local embedding failed (source=${memorySettings.embeddingSource}, ` +
++        `reason=${local.reason}): ${local.message}`
++    );
++  }
++  // ── end LOCAL PATCH 0002 ──────────────────────────────────────────────────
++
+   const modelStr = cfg.embeddingModel.trim();
+   if (!modelStr.includes("/")) {
+     throw new Error(`Invalid embedding model '${modelStr}'. Use provider/model format.`);

@@ -1,0 +1,11 @@
+# secrets and live state — NEVER commit
+.env
+data/
+data.backup*/
+backups/
+*.tgz
+*.sqlite*
+# build inputs / artefacts
+src/
+cli-tools/node_modules/
+build-*.log

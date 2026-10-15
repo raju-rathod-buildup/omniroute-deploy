@@ -1,0 +1,252 @@
+diff --git a/src/shared/components/ProviderIcon.tsx b/src/shared/components/ProviderIcon.tsx
+index 2f4df48d1..eb1d46506 100644
+--- a/src/shared/components/ProviderIcon.tsx
++++ b/src/shared/components/ProviderIcon.tsx
+@@ -12,6 +12,7 @@
+  *    verified source/license provenance. Those IDs must never fall through to an icon CDN.
+  * 2. Theme-aware static SVGs (`THEMED_SVGS`)
+  * 3. Try /providers/{id}.svg (local SVG assets — fastest, cached separately from JS bundle)
++ * 3b. Try /providers/{id}.png (LOCAL PATCH 0011 — locally sourced logomarks)
+  * 4. Try @lobehub/icons direct React components (no @lobehub/ui peer runtime)
+  * 5. Fall back to thesvg.org CDN (external SVG)
+  * 6. Fall back to a generic AI icon
+@@ -64,12 +65,15 @@ function GenericProviderIcon({ size }: { size: number }) {
+ 
+ const KNOWN_SVGS = new Set([
+   "360ai",
++  "ainative",
++  "aion",
+   "alibaba",
+   "anthropic",
+   "arcee",
+   "arcee-ai",
+   "assemblyai",
+   "auggie",
++  "auriko",
+   "aws",
+   "azure",
+   "azureai",
+@@ -81,11 +85,15 @@ const KNOWN_SVGS = new Set([
+   "bytez",
+   "cerebras",
+   "charm-hyper",
++  "chatanywhere",
+   "chutes",
+   "claude",
+   "claude-web",
+   "cline",
++  "cloudcode-one",
+   "cloudflare",
++  "cloudflare-playground",
++  "clova-studio",
+   "codex",
+   "cohere",
+   "comfyui",
+@@ -101,14 +109,23 @@ const KNOWN_SVGS = new Set([
+   "dify",
+   "dit",
+   "doubao",
++  "dxnt",
+   "elevenlabs",
+   "exa",
+   "factory",
+   "fal",
++  "felo-web",
+   "fireworks",
++  "free-ai",
+   "freeaiapikey",
+   "freemodel-dev",
++  "freetheai",
+   "friendli",
++  "g4f-gemini",
++  "g4f-groq",
++  "g4f-nvidia",
++  "g4f-ollama",
++  "g4f-pollinations",
+   "galadriel",
+   "gemini",
+   "gitlawb",
+@@ -120,6 +137,7 @@ const KNOWN_SVGS = new Set([
+   "heroku",
+   "huggingchat",
+   "huggingface",
++  "hyperagent",
+   "hyperbolic",
+   "ibm",
+   "iflytek",
+@@ -131,7 +149,9 @@ const KNOWN_SVGS = new Set([
+   "krutrim",
+   "lambda",
+   "liquid",
++  "llm-kiwi",
+   "llm7",
++  "lmarena",
+   "longcat",
+   "meta",
+   "metaai",
+@@ -140,16 +160,22 @@ const KNOWN_SVGS = new Set([
+   "monsterapi",
+   "moonshot",
+   "morph",
++  "naga-ac",
++  "naga-ai",
++  "nara",
+   "nebius",
+   "nlpcloud",
+   "nomic",
++  "notion-web",
+   "novita",
+   "nube",
+   "nvidia",
++  "ofoxai",
+   "ollama",
+   "openadapter",
+   "openai",
+   "openclaw",
++  "openference-api",
+   "openrouter",
+   "opper",
+   "orcarouter",
+@@ -159,16 +185,19 @@ const KNOWN_SVGS = new Set([
+   "picoclaw",
+   "pioneer",
+   "poe",
++  "poixe-ai",
+   "pollinations",
+   "poolside",
+   "publicai",
+   "qwen",
++  "raycast",
+   "recraft",
+   "replicate",
+   "requesty",
+   "roocode",
+   "runway",
+   "sambanova",
++  "sarvam",
+   "searchapi",
+   "sensenova",
+   "snowflake",
+@@ -179,9 +208,11 @@ const KNOWN_SVGS = new Set([
+   "t3-web",
+   "tavily",
+   "tencent",
++  "token-kiosk",
+   "tokenrouter",
+   "topazlabs",
+   "trae",
++  "typhoon",
+   "udio",
+   "uncloseai",
+   "upstage",
+@@ -194,15 +225,54 @@ const KNOWN_SVGS = new Set([
+   "wafer",
+   "x5lab",
+   "xai",
++  "xiaomi-mimo-token-plan",
+   "xinference",
+   "yi",
+   "yuanbao-web",
++  "zai-web",
+   "zed-hosted",
+   "zenmux",
+   "zenmux-free",
+   "zhipu",
+ ]);
+ 
++// LOCAL PATCH 0011 — provider logomarks sourced for this deploy.
++//
++// v3.8.51 removed upstream's KNOWN_PNGS tier along with 83 bundled logos whose
++// source/license/trademark provenance could not be demonstrated (see
++// GENERIC_PROVIDER_IDS below). This set is NOT a revival of those assets — every id
++// here was independently sourced under the policy in tools/provider-icons/README.md
++// (the provider's own site, or Simple Icons CC0-1.0 via an explicit slug map) and each
++// one's source URL is recorded in tools/provider-icons/icon-provenance.tsv.
++//
++// The provenance guard above still wins: an id in GENERIC_PROVIDER_IDS renders the
++// generic mark even if it appears here, so upstream's determination stays authoritative
++// and this set can never silently re-ship an asset upstream pulled.
++const LOCAL_PNGS = new Set([
++  "agnes",
++  "ant-ling",
++  "anyapi",
++  "chat-oripe",
++  "conol-web",
++  "deepai",
++  "electronhub",
++  "fastrouter",
++  "helyxai",
++  "inception",
++  "internlm",
++  "llmgateway",
++  "mnn-ai",
++  "openvecta",
++  "plamo",
++  "regolo",
++  "routeway",
++  "tencent-aistudio-web",
++  "tokenreply",
++  "writer",
++  "yolo-auto",
++  "zerolimitai",
++]);
++
+ const LOCAL_SVG_ALIASES: Record<string, string> = {
+   "cursor-api": "cursor",
+   "qwen-cloud": "qwencloud",
+@@ -351,17 +421,20 @@ const ProviderIcon = memo(function ProviderIcon({
+     ? THEMED_SVGS[normalizedId]
+     : undefined;
+   const hasSvg = KNOWN_SVGS.has(localSvgId);
++  const hasPng = LOCAL_PNGS.has(normalizedId);
+ 
+   const [failedAssets, setFailedAssets] = useState<Record<string, true>>({});
+   const [remoteSrcFailed, setRemoteSrcFailed] = useState(false);
+   const themedKey = `${normalizedId}:themed`;
+   const svgKey = `${normalizedId}:svg`;
+   const theSvgKey = `${normalizedId}:thesvg`;
++  const pngKey = `${normalizedId}:png`;
+ 
+   const trimmedSrc = typeof src === "string" ? src.trim() : "";
+   const themedFailed = failedAssets[themedKey];
+   const svgFailed = failedAssets[svgKey];
+   const theSvgFailed = failedAssets[theSvgKey];
++  const pngFailed = failedAssets[pngKey];
+ 
+   // #2166: a custom remote icon URL always wins over the resolution chain below.
+   // It is a plain <img> (not next/image) so operators can point at any host
+@@ -480,6 +553,34 @@ const ProviderIcon = memo(function ProviderIcon({
+     );
+   }
+ 
++  // Tier 3b (LOCAL PATCH 0011): locally sourced PNG logomark. Sits after the local SVG
++  // tier and before LobeHub so a mark sourced from the provider's own site beats a
++  // third-party approximation. Plain <img> for the same reason Tier 3 uses one: these are
++  // non-square wordmarks, and next/image's dev-mode check false-positives on them.
++  if (hasPng && !pngFailed) {
++    return (
++      <span
++        className={className}
++        style={{ display: "inline-flex", alignItems: "center", ...style }}
++      >
++        {/* eslint-disable-next-line @next/next/no-img-element -- local static PNG asset, see Tier 3 */}
++        <img
++          src={`/providers/${normalizedId}.png`}
++          alt={providerId}
++          width={size}
++          height={size}
++          style={{
++            objectFit: "contain",
++            flex: "none",
++            width: size,
++            height: size,
++          }}
++          onError={() => setFailedAssets((current) => ({ ...current, [pngKey]: true }))}
++        />
++      </span>
++    );
++  }
++
+   // Tier 4: LobeHub npm icons — only when no local SVG (or SVG failed to load)
+   if (lobeIcon) {
+     return (

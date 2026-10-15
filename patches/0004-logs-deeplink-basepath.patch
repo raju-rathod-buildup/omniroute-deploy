@@ -1,0 +1,64 @@
+diff --git a/src/shared/components/RequestLoggerV2.tsx b/src/shared/components/RequestLoggerV2.tsx
+index 924ee4301..4cde946c0 100644
+--- a/src/shared/components/RequestLoggerV2.tsx
++++ b/src/shared/components/RequestLoggerV2.tsx
+@@ -9,7 +9,7 @@ import {
+   forwardRef,
+   useImperativeHandle,
+ } from "react";
+-import { useRouter } from "next/navigation";
++import { useRouter, usePathname } from "next/navigation";
+ import { useTranslations } from "next-intl";
+ import Card from "./Card";
+ import RequestLoggerDetail from "./RequestLoggerDetail";
+@@ -535,6 +535,18 @@ const RequestLoggerV2 = forwardRef<RequestLoggerV2Handle, { initialSelectedId?:
+     // request is still being finalized, keep the modal open and poll this same
+     // endpoint until the row appears.
+     const router = useRouter();
++    // MUST come from usePathname(), never from globalThis.location.pathname.
++    //
++    // When the app is deployed under a basePath (OMNIROUTE_BASE_PATH=/omni here),
++    // location.pathname still carries that prefix — "/omni/dashboard/logs" — while
++    // router.replace() prepends the basePath to whatever it is handed. Feeding one
++    // into the other produced "/omni/omni/dashboard/logs?id=..." and a hard 404
++    // every time a log row was opened. usePathname() returns the path with the
++    // basePath already stripped, so the round-trip is lossless.
++    //
++    // Invisible upstream because basePath is "" on a root deployment, which makes
++    // the doubled prefix a no-op there.
++    const pathname = usePathname();
+ 
+     const closeDetail = useCallback(() => {
+       detailRequestRef.current = "";
+@@ -544,11 +556,11 @@ const RequestLoggerV2 = forwardRef<RequestLoggerV2Handle, { initialSelectedId?:
+         // remove id param when closing detail
+         const url = new URL(globalThis.location.href);
+         url.searchParams.delete("id");
+-        router.replace(url.pathname + url.search, { scroll: false });
++        router.replace(pathname + url.search, { scroll: false });
+       } catch (e) {
+         // ignore navigation errors
+       }
+-    }, [router]);
++    }, [router, pathname]);
+ 
+     const openDetail = useCallback(
+       async (logEntry) => {
+@@ -568,7 +580,7 @@ const RequestLoggerV2 = forwardRef<RequestLoggerV2Handle, { initialSelectedId?:
+         try {
+           const url = new URL(globalThis.location.href);
+           url.searchParams.set("id", logEntry.id);
+-          router.replace(url.pathname + url.search, { scroll: false });
++          router.replace(pathname + url.search, { scroll: false });
+         } catch (e) {
+           // ignore navigation errors
+         }
+@@ -632,7 +644,7 @@ const RequestLoggerV2 = forwardRef<RequestLoggerV2Handle, { initialSelectedId?:
+           if (isCurrentDetailRequest()) setDetailLoading(false);
+         }
+       },
+-      [closeDetail, router]
++      [closeDetail, router, pathname]
+     );
+ 
+     const sortedLogsForNav = useMemo(() => sortedLogs, [sortedLogs]);

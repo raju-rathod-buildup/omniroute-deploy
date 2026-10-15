@@ -1,0 +1,366 @@
+diff --git a/src/app/(dashboard)/dashboard/providers/[id]/components/ProviderPlaygroundPanel.tsx b/src/app/(dashboard)/dashboard/providers/[id]/components/ProviderPlaygroundPanel.tsx
+--- a/src/app/(dashboard)/dashboard/providers/[id]/components/ProviderPlaygroundPanel.tsx
++++ b/src/app/(dashboard)/dashboard/providers/[id]/components/ProviderPlaygroundPanel.tsx
+@@ -20,6 +20,8 @@
+ import type { ServiceKind } from "@/shared/constants/providers";
+ import { AI_PROVIDERS } from "@/shared/constants/providers";
+ import { providerText } from "../providerPageHelpers";
++import { useProviderModels } from "../../hooks/useProviderModels";
++import { deriveServiceKinds, mergeServiceKinds } from "../../utils/serviceKinds";
+ 
+ export const MEDIA_SERVICE_KINDS: ServiceKind[] = [
+   "embedding",
+@@ -85,8 +87,13 @@
+       ? rawKinds.filter((k): k is ServiceKind => (ALL_VALID_KINDS as readonly string[]).includes(k))
+       : ["llm"];
+ 
++  // Add Image / TTS / STT tabs for any provider whose models are of that kind
++  // (declared kinds keep their order; derived kinds are appended).
++  const { models } = useProviderModels(providerId);
++  const mergedKinds = mergeServiceKinds(kinds, deriveServiceKinds(models));
++
+   // Filter out kinds that have no playground implementation yet
+-  const playgroundableKinds = kinds.filter((k) => k !== "imageToText");
++  const playgroundableKinds = mergedKinds.filter((k) => k !== "imageToText");
+ 
+   // useState must be called unconditionally (Rules of Hooks)
+   const [activeKind, setActiveKind] = useState<ServiceKind>(playgroundableKinds[0] ?? "llm");
+diff --git a/src/app/(dashboard)/dashboard/media-providers/components/ImageExampleCard.tsx b/src/app/(dashboard)/dashboard/media-providers/components/ImageExampleCard.tsx
+--- a/src/app/(dashboard)/dashboard/media-providers/components/ImageExampleCard.tsx
++++ b/src/app/(dashboard)/dashboard/media-providers/components/ImageExampleCard.tsx
+@@ -6,6 +6,8 @@
+ import { useApiKey } from "../../providers/hooks/useApiKey";
+ import { useProviderModels } from "../../providers/hooks/useProviderModels";
+ import { buildCurl } from "../../providers/utils/buildCurl";
++import { filterModelsByKind } from "../../providers/utils/serviceKinds";
++import { detectImageMime, imageExtension } from "../../providers/utils/imageMime";
+ import { PLAYGROUND_KEY_ID_HEADER, resolvePlaygroundKeyId } from "../../providers/utils/playgroundAuth";
+ import { PlaygroundCard } from "./PlaygroundCard";
+ 
+@@ -68,7 +70,23 @@
+   return null;
+ }
+ 
+-function ImageResultRenderer(data: unknown, altText: string) {
++function openFullSize(src: string) {
++  if (!src.startsWith("data:")) {
++    window.open(src, "_blank", "noopener,noreferrer");
++    return;
++  }
++  // Browsers block top-level navigation to data: URLs, so open a blob: URL instead.
++  fetch(src)
++    .then((r) => r.blob())
++    .then((blob) => window.open(URL.createObjectURL(blob), "_blank", "noopener"))
++    .catch(() => undefined);
++}
++
++function ImageResultRenderer(
++  data: unknown,
++  altText: string,
++  labels: { open: string; download: string }
++) {
+   if (!data || typeof data !== "object") return null;
+   const d = data as Record<string, unknown>;
+   const items = Array.isArray(d.data) ? (d.data as Array<Record<string, unknown>>) : [];
+@@ -76,23 +94,41 @@
+     return <pre className="text-xs p-3 text-text-main">{JSON.stringify(data, null, 2)}</pre>;
+   }
+   return (
+-    <div className="flex flex-wrap gap-2 p-3">
++    <div className="flex flex-wrap gap-3 p-3">
+       {items.map((item, i) => {
+         const url = typeof item.url === "string" ? item.url : null;
+         const b64 = typeof item.b64_json === "string" ? item.b64_json : null;
+-        const src = url ?? (b64 ? `data:image/png;base64,${b64}` : null);
++        const mime = b64 ? detectImageMime(b64) : null;
++        const src = url ?? (b64 && mime ? `data:${mime};base64,${b64}` : null);
+         if (!src) return null;
+         return (
+-          <Image
+-            key={i}
+-            src={src}
+-            alt={`${altText} ${i + 1}`}
+-            width={200}
+-            height={200}
+-            unoptimized
+-            className="max-w-full rounded-lg border border-border"
+-            style={{ maxHeight: "200px", objectFit: "contain" }}
+-          />
++          <div key={i} className="flex flex-col gap-1">
++            <Image
++              src={src}
++              alt={`${altText} ${i + 1}`}
++              width={200}
++              height={200}
++              unoptimized
++              className="max-w-full rounded-lg border border-border"
++              style={{ maxHeight: "200px", objectFit: "contain" }}
++            />
++            <div className="flex gap-3 text-xs text-text-muted">
++              <button
++                type="button"
++                onClick={() => openFullSize(src)}
++                className="hover:text-text-main"
++              >
++                {labels.open}
++              </button>
++              <a
++                href={src}
++                download={`generated-${i + 1}.${imageExtension(mime)}`}
++                className="hover:text-text-main"
++              >
++                {labels.download}
++              </a>
++            </div>
++          </div>
+         );
+       })}
+     </div>
+@@ -103,7 +139,8 @@
+   const t = useTranslations("miniPlayground");
+   const tMedia = useTranslations("media");
+   const { apiKey, keys } = useApiKey();
+-  const { models } = useProviderModels(providerId);
++  const { models: allModels } = useProviderModels(providerId);
++  const models = filterModelsByKind(allModels, "image");
+   const suggestedModels = useHfSuggestedImageModels(providerId);
+ 
+   const firstModel = models[0]?.id ?? "dall-e-3";
+@@ -115,7 +152,8 @@
+   const [error, setError] = useState<string | null>(null);
+ 
+   const effectiveModel = model || firstModel;
+-  const buildBody = () => ({ model: effectiveModel, prompt, size, n: 1 });
++  // Only fields every provider accepts: Logfare flux models reject `n` and `response_format`.
++  const buildBody = () => ({ model: effectiveModel, prompt, size });
+ 
+   const curlSnippet = buildCurl({
+     endpoint:
+@@ -177,7 +215,12 @@
+       running={running}
+       result={result}
+       error={error}
+-      resultRenderer={(data) => ImageResultRenderer(data, tMedia("generatedImageAlt"))}
++      resultRenderer={(data) =>
++        ImageResultRenderer(data, tMedia("generatedImageAlt"), {
++          open: tMedia("openFullSize"),
++          download: tMedia("downloadImage"),
++        })
++      }
+     >
+       {/* Model */}
+       <div>
+diff --git a/src/app/(dashboard)/dashboard/media-providers/components/TtsExampleCard.tsx b/src/app/(dashboard)/dashboard/media-providers/components/TtsExampleCard.tsx
+--- a/src/app/(dashboard)/dashboard/media-providers/components/TtsExampleCard.tsx
++++ b/src/app/(dashboard)/dashboard/media-providers/components/TtsExampleCard.tsx
+@@ -5,6 +5,7 @@
+ import { useApiKey } from "../../providers/hooks/useApiKey";
+ import { useProviderModels } from "../../providers/hooks/useProviderModels";
+ import { buildCurl } from "../../providers/utils/buildCurl";
++import { filterModelsByKind } from "../../providers/utils/serviceKinds";
+ import { PLAYGROUND_KEY_ID_HEADER, resolvePlaygroundKeyId } from "../../providers/utils/playgroundAuth";
+ import { PlaygroundCard } from "./PlaygroundCard";
+ 
+@@ -28,7 +29,8 @@
+ export function TtsExampleCard({ providerId }: Props) {
+   const t = useTranslations("miniPlayground");
+   const { apiKey, keys } = useApiKey();
+-  const { models } = useProviderModels(providerId);
++  const { models: allModels } = useProviderModels(providerId);
++  const models = filterModelsByKind(allModels, "tts");
+ 
+   const firstModel = models[0]?.id ?? "tts-1";
+   const [model, setModel] = useState<string>("");
+diff --git a/src/i18n/messages/en.json b/src/i18n/messages/en.json
+--- a/src/i18n/messages/en.json
++++ b/src/i18n/messages/en.json
+@@ -2495,6 +2495,8 @@
+     "transcriptionPlaceholder": "Upload an audio file to transcribe...",
+     "noImagesReturned": "No images returned. The provider might have accepted the request but returned empty data.",
+     "generatedImageAlt": "Generated image {index}",
++    "openFullSize": "Open full size",
++    "downloadImage": "Download image",
+     "save": "Save",
+     "enterTextToSynthesize": "Please enter text to synthesize.",
+     "selectAudioToTranscribe": "Please select an audio file to transcribe.",
+diff --git a/src/app/(dashboard)/dashboard/providers/utils/serviceKinds.ts b/src/app/(dashboard)/dashboard/providers/utils/serviceKinds.ts
+new file mode 100644
+--- /dev/null
++++ b/src/app/(dashboard)/dashboard/providers/utils/serviceKinds.ts
+@@ -0,0 +1,42 @@
++import type { ServiceKind } from "@/shared/constants/providers";
++
++type TypedModel = { type?: string; subtype?: string };
++
++// Kinds that can be derived from model metadata, in the order tabs are appended.
++const DERIVABLE_KINDS = ["image", "tts", "stt"] as const;
++
++function matchesKind(m: TypedModel, kind: ServiceKind): boolean {
++  switch (kind) {
++    case "llm":
++      return !m.type || m.type === "chat";
++    case "image":
++      return m.type === "image";
++    case "tts":
++      return m.type === "audio" && m.subtype === "speech";
++    case "stt":
++      return m.type === "audio" && m.subtype === "transcription";
++    default:
++      return true;
++  }
++}
++
++/**
++ * Models of one kind, using the `type`/`subtype` the provider models API returns.
++ * A catalog where NO model carries a type is returned unchanged, so providers
++ * without type metadata behave exactly as before.
++ */
++export function filterModelsByKind<T extends TypedModel>(models: T[], kind: ServiceKind): T[] {
++  const matched = models.filter((m) => matchesKind(m, kind));
++  if (matched.length > 0) return matched;
++  return models.some((m) => m.type) ? [] : models;
++}
++
++/** Image / TTS / STT kinds that at least one typed model supports, in tab order. */
++export function deriveServiceKinds(models: TypedModel[]): ServiceKind[] {
++  return DERIVABLE_KINDS.filter((kind) => models.some((m) => m.type && matchesKind(m, kind)));
++}
++
++/** Declared kinds first (order preserved), then derived kinds not already declared. */
++export function mergeServiceKinds(declared: ServiceKind[], derived: ServiceKind[]): ServiceKind[] {
++  return [...declared, ...derived.filter((k) => !declared.includes(k))];
++}
+diff --git a/src/app/(dashboard)/dashboard/providers/utils/imageMime.ts b/src/app/(dashboard)/dashboard/providers/utils/imageMime.ts
+new file mode 100644
+--- /dev/null
++++ b/src/app/(dashboard)/dashboard/providers/utils/imageMime.ts
+@@ -0,0 +1,21 @@
++/** Image MIME type from the first characters of a base64 payload (magic bytes). */
++export function detectImageMime(b64: string): string {
++  if (b64.startsWith("/9j/")) return "image/jpeg";
++  if (b64.startsWith("iVBOR")) return "image/png";
++  if (b64.startsWith("UklGR")) return "image/webp";
++  if (b64.startsWith("R0lGOD")) return "image/gif";
++  return "image/png";
++}
++
++export function imageExtension(mime: string | null): string {
++  switch (mime) {
++    case "image/jpeg":
++      return "jpg";
++    case "image/webp":
++      return "webp";
++    case "image/gif":
++      return "gif";
++    default:
++      return "png";
++  }
++}
+diff --git a/tests/unit/playground-service-kinds.test.ts b/tests/unit/playground-service-kinds.test.ts
+new file mode 100644
+--- /dev/null
++++ b/tests/unit/playground-service-kinds.test.ts
+@@ -0,0 +1,72 @@
++import test from "node:test";
++import assert from "node:assert/strict";
++import {
++  filterModelsByKind,
++  deriveServiceKinds,
++  mergeServiceKinds,
++} from "../../src/app/(dashboard)/dashboard/providers/utils/serviceKinds.ts";
++
++// Shape of GET /api/v1/providers/logfare/models (verified live on 2026-10-10).
++const logfare = [
++  { id: "whisper-large-v3-turbo", type: "audio", subtype: "transcription" },
++  { id: "nova-3", type: "audio", subtype: "transcription" },
++  { id: "aura-2-en", type: "audio", subtype: "speech" },
++  { id: "flux-1-schnell", type: "image" },
++  { id: "sdxl-lightning", type: "image" },
++  { id: "logfare/auto" },
++  { id: "gemma-4-26b" },
++];
++
++const ids = (list: Array<{ id: string }>) => list.map((m) => m.id);
++
++test("filterModelsByKind image returns only image models", () => {
++  assert.deepEqual(ids(filterModelsByKind(logfare, "image")), ["flux-1-schnell", "sdxl-lightning"]);
++});
++
++test("filterModelsByKind tts returns only speech models", () => {
++  assert.deepEqual(ids(filterModelsByKind(logfare, "tts")), ["aura-2-en"]);
++});
++
++test("filterModelsByKind stt returns only transcription models", () => {
++  assert.deepEqual(ids(filterModelsByKind(logfare, "stt")), ["whisper-large-v3-turbo", "nova-3"]);
++});
++
++test("filterModelsByKind llm returns models without a type or with type chat", () => {
++  const mixed = [...logfare, { id: "chat-1", type: "chat" }];
++  assert.deepEqual(ids(filterModelsByKind(mixed, "llm")), ["logfare/auto", "gemma-4-26b", "chat-1"]);
++});
++
++test("filterModelsByKind on an empty list is empty", () => {
++  assert.deepEqual(filterModelsByKind([], "image"), []);
++});
++
++test("filterModelsByKind passes untyped catalogs through unchanged", () => {
++  const untyped = [{ id: "a" }, { id: "b" }];
++  assert.deepEqual(ids(filterModelsByKind(untyped, "image")), ["a", "b"]);
++});
++
++test("filterModelsByKind returns empty when models are typed but none match", () => {
++  assert.deepEqual(filterModelsByKind([{ id: "c", type: "image" }], "tts"), []);
++});
++
++test("deriveServiceKinds finds image, tts and stt from a mixed catalog", () => {
++  assert.deepEqual(deriveServiceKinds(logfare), ["image", "tts", "stt"]);
++});
++
++test("deriveServiceKinds is empty for chat-only or empty catalogs", () => {
++  assert.deepEqual(deriveServiceKinds([{ id: "x" }, { id: "y", type: "chat" }]), []);
++  assert.deepEqual(deriveServiceKinds([]), []);
++});
++
++test("deriveServiceKinds ignores untyped catalogs", () => {
++  assert.deepEqual(deriveServiceKinds([{ id: "a" }]), []);
++});
++
++test("mergeServiceKinds keeps declared order and appends derived kinds", () => {
++  assert.deepEqual(mergeServiceKinds(["llm"], ["image", "tts", "stt"]), ["llm", "image", "tts", "stt"]);
++  assert.deepEqual(mergeServiceKinds(["image", "llm"], ["image", "stt"]), ["image", "llm", "stt"]);
++});
++
++test("mergeServiceKinds with nothing derived returns the declared kinds", () => {
++  assert.deepEqual(mergeServiceKinds(["llm", "embedding"], []), ["llm", "embedding"]);
++});
+diff --git a/tests/unit/playground-image-mime.test.ts b/tests/unit/playground-image-mime.test.ts
+new file mode 100644
+--- /dev/null
++++ b/tests/unit/playground-image-mime.test.ts
+@@ -0,0 +1,26 @@
++import test from "node:test";
++import assert from "node:assert/strict";
++import {
++  detectImageMime,
++  imageExtension,
++} from "../../src/app/(dashboard)/dashboard/providers/utils/imageMime.ts";
++
++test("detectImageMime recognises jpeg (Logfare output), png, webp and gif", () => {
++  assert.equal(detectImageMime("/9j/4AAQSkZJRgABAQ"), "image/jpeg");
++  assert.equal(detectImageMime("iVBORw0KGgoAAAANSUhEUg"), "image/png");
++  assert.equal(detectImageMime("UklGRiQAAABXRUJQVlA4"), "image/webp");
++  assert.equal(detectImageMime("R0lGODlhAQABAIAAAAAAAP"), "image/gif");
++});
++
++test("detectImageMime falls back to png for unknown or empty data", () => {
++  assert.equal(detectImageMime("AAAA"), "image/png");
++  assert.equal(detectImageMime(""), "image/png");
++});
++
++test("imageExtension maps mime types to file extensions", () => {
++  assert.equal(imageExtension("image/jpeg"), "jpg");
++  assert.equal(imageExtension("image/png"), "png");
++  assert.equal(imageExtension("image/webp"), "webp");
++  assert.equal(imageExtension("image/gif"), "gif");
++  assert.equal(imageExtension(null), "png");
++});

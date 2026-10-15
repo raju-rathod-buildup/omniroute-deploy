@@ -1,0 +1,72 @@
+diff --git a/Dockerfile b/Dockerfile
+index 1924fce..4521b80 100644
+--- a/Dockerfile
++++ b/Dockerfile
+@@ -144,7 +144,7 @@ ENV NODE_OPTIONS="--max-old-space-size=${OMNIROUTE_MEMORY_MB}"
+ 
+ # Data directory inside Docker — must match the volume mount in docker-compose.yml
+ ENV DATA_DIR=/app/data
+-RUN mkdir -p /app/data
++RUN mkdir -p /app/data && chown node:node /app /app/data
+ 
+ # `npm run build` (build-next-isolated → assembleStandalone) bundles ALL runtime
+ # files into .build/next/standalone/ — .next, node_modules, migrations, scripts,
+@@ -154,23 +154,28 @@ RUN mkdir -p /app/data
+ # The old per-module overrides were therefore pure duplication and were removed
+ # (build-output-isolation cleanup). See scripts/build/assembleStandalone.mjs
+ # (EXTRA_MODULE_ENTRIES) for the single source of truth.
+-COPY --from=builder /app/.build/next/standalone ./
++COPY --from=builder --chown=node:node /app/.build/next/standalone ./
+ # better-sqlite3 is the one exception still copied explicitly: assembleStandalone
+ # only syncs its native build/ dir; the JS wrapper (lib/, package.json) is left to
+ # Next.js tracing. bootstrap-env requires SQLite BEFORE the standalone server
+ # starts, so guarantee the complete package independent of trace behaviour.
+-COPY --from=builder /app/node_modules/better-sqlite3 ./node_modules/better-sqlite3
++COPY --from=builder --chown=node:node /app/node_modules/better-sqlite3 ./node_modules/better-sqlite3
+ # migrations land at <standalone>/migrations via assembleStandalone; point the runtime at them.
+ ENV OMNIROUTE_MIGRATIONS_DIR=/app/migrations
+ 
+ # Docker healthcheck script — not traced by Next.js standalone output, so copy
+ # it explicitly. The HEALTHCHECK CMD references it as `node healthcheck.mjs`.
+-COPY --from=builder /app/scripts/dev/healthcheck.mjs ./healthcheck.mjs
++COPY --from=builder --chown=node:node /app/scripts/dev/healthcheck.mjs ./healthcheck.mjs
+ 
+ # Hand /app over to the baked-in `node` non-root user (UID/GID 1000) so the
+-# runtime process never holds root privileges. The chown happens after all
+-# COPYs so it covers files originally owned by root in the builder stage.
+-RUN chown -R node:node /app
++# runtime process never holds root privileges.
++#
++# This was `RUN chown -R node:node /app`, which re-walked the entire standalone
++# tree (app + node_modules) on every build: 104s, ~10% of a 17.5-minute build,
++# and never cacheable because its parent COPY changes every time. Each COPY now
++# carries --chown, which sets ownership as the files are written, for free. The
++# only thing the recursive walk covered that the COPYs do not is /app itself and
++# /app/data, both created by this stage — so those are chowned explicitly above.
+ 
+ EXPOSE 20128
+ 
+diff --git a/next.config.mjs b/next.config.mjs
+index 8eccf14..e6e1a92 100644
+--- a/next.config.mjs
++++ b/next.config.mjs
+@@ -170,6 +170,19 @@ const nextConfig = {
+   // accept for image-bearing requests; tune via env if a deployment needs
+   // more.
+   experimental: {
++    // Turbopack recompiles from scratch unless this is set — measured 2026-08-21:
++    // "Compiled successfully in 10.4min", 60% of a 17.5-minute image build, and
++    // IDENTICAL across two consecutive builds (src1 15m38s, src2 15m48s) despite
++    // the Dockerfile's --mount=type=cache,id=next-cache,target=/app/.build/next/cache.
++    // That mount targets distDir/cache, exactly where Turbopack keeps its filesystem
++    // cache — the plumbing was already correct and simply unused.
++    //
++    // NOT `turbopackPersistentCaching`: that key was removed in Next 16.2 and is a
++    // FATAL config error here. Its migration message points only at the ...ForDev
++    // variant, which is the dev server's cache and does nothing for `next build`;
++    // ...ForBuild is the production-build counterpart and the one that matters.
++    // Both are real keys in next/dist/server/config-schema.js (z.boolean().optional()).
++    turbopackFileSystemCacheForBuild: true,
+     serverActions: {
+       bodySizeLimit: process.env.OMNIROUTE_SERVER_ACTIONS_BODY_LIMIT || "50mb",
+     },

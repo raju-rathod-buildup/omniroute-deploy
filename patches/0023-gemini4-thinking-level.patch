@@ -1,0 +1,55 @@
+diff --git a/open-sse/translator/request/openai-to-gemini.ts b/open-sse/translator/request/openai-to-gemini.ts
+index d68946369..7f519afde 100644
+--- a/open-sse/translator/request/openai-to-gemini.ts
++++ b/open-sse/translator/request/openai-to-gemini.ts
+@@ -301,6 +301,17 @@ function openaiToGeminiBase(
+     }
+   }
+ 
++  // Gemini 4 rejects a numeric thinkingBudget ("Use thinking level instead") and accepts only
++  // thinkingLevel low/medium/high ("minimal" is rejected). Convert the budget computed above.
++  const geminiThinkingConfig = result.generationConfig.thinkingConfig as
++    | { thinkingBudget?: number; thinkingLevel?: string }
++    | undefined;
++  if (model.toLowerCase().startsWith("gemini-4") && typeof geminiThinkingConfig?.thinkingBudget === "number") {
++    const budget = geminiThinkingConfig.thinkingBudget;
++    delete geminiThinkingConfig.thinkingBudget;
++    geminiThinkingConfig.thinkingLevel = budget <= 1024 ? "low" : budget <= 10240 ? "medium" : "high";
++  }
++
+   // Build tool_call_id -> name map
+   const tcID2Name: Record<string, string> = {};
+   // #7752: strip any non-trailing tool_call whose id has no matching tool_result
+diff --git a/tests/unit/openai-to-gemini-gemini4-thinking-level.test.ts b/tests/unit/openai-to-gemini-gemini4-thinking-level.test.ts
+new file mode 100644
+index 000000000..9da85094a
+--- /dev/null
++++ b/tests/unit/openai-to-gemini-gemini4-thinking-level.test.ts
+@@ -0,0 +1,27 @@
++import test from "node:test";
++import assert from "node:assert/strict";
++
++const { openaiToGeminiRequest } = await import("../../open-sse/translator/request/openai-to-gemini.ts");
++
++const messages = [{ role: "user", content: "hi" }];
++
++test("gemini-4 models get thinkingLevel instead of thinkingBudget (default injection)", () => {
++  const out = openaiToGeminiRequest("gemini-4-argon", { messages }, false);
++  const cfg = out.generationConfig.thinkingConfig;
++  assert.equal(cfg.thinkingBudget, undefined);
++  assert.ok(["low", "medium", "high"].includes(cfg.thinkingLevel));
++});
++
++test("gemini-4 reasoning_effort maps to a supported level (none -> low, never minimal)", () => {
++  for (const [effort, level] of [["none", "low"], ["low", "low"], ["medium", "medium"], ["high", "high"]]) {
++    const out = openaiToGeminiRequest("gemini-4-argon", { messages, reasoning_effort: effort }, false);
++    assert.equal(out.generationConfig.thinkingConfig.thinkingBudget, undefined, effort);
++    assert.equal(out.generationConfig.thinkingConfig.thinkingLevel, level, effort);
++  }
++});
++
++test("other Gemini models keep numeric thinkingBudget", () => {
++  const out = openaiToGeminiRequest("gemini-2.5-flash", { messages, reasoning_effort: "low" }, false);
++  assert.equal(typeof out.generationConfig.thinkingConfig.thinkingBudget, "number");
++  assert.equal(out.generationConfig.thinkingConfig.thinkingLevel, undefined);
++});

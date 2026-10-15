@@ -1,0 +1,86 @@
+diff --git a/src/lib/memory/store.ts b/src/lib/memory/store.ts
+index 549f61a..a60c213 100644
+--- a/src/lib/memory/store.ts
++++ b/src/lib/memory/store.ts
+@@ -119,6 +119,31 @@ function safeMarkNeedsReindex(id: string, needs: boolean): void {
+   }
+ }
+ 
++// In-flight Qdrant upserts, keyed by memory id.
++//
++// upsertSemanticMemoryPoint() is deliberately fire-and-forget so a slow vector
++// write never blocks the SQLite insert. That is fine until something deletes the
++// same memory microseconds later: deleteMemory() removes the point BEFORE the
++// in-flight upsert writes it back, leaving an orphan with no SQLite row.
++//
++// verifyExtractionPipeline() does exactly that on every /api/memory/health call —
++// it creates a __extraction_test__ memory and deletes it in a finally block, and
++// the health check returns in ~2ms. Measured on this deploy: 34 orphaned points
++// against 2 real memories, i.e. 94% of the vector store was garbage. Orphans
++// consume slots in Qdrant's top-100 result set before fetchMemoriesByIds() drops
++// them, so retrieval quality degrades silently as they accumulate.
++//
++// deleteMemory() awaits any pending upsert for that id before deleting, which
++// closes the race without making the write path synchronous.
++const pendingQdrantUpserts = new Map<string, Promise<unknown>>();
++
++function trackQdrantUpsert(id: string, p: Promise<unknown>): void {
++  const tracked = p.finally(() => {
++    if (pendingQdrantUpserts.get(id) === tracked) pendingQdrantUpserts.delete(id);
++  });
++  pendingQdrantUpserts.set(id, tracked);
++}
++
+ function scheduleVectorUpsert(id: string, content: string): void {
+   setImmediate(async () => {
+     try {
+@@ -218,7 +243,7 @@ export async function createMemory(
+     scheduleVectorUpsert(String(existing.id), memory.content);
+ 
+     // Best-effort re-sync to Qdrant after update
+-    upsertSemanticMemoryPoint({
++    trackQdrantUpsert(String(existing.id), upsertSemanticMemoryPoint({
+       id: String(existing.id),
+       apiKeyId: memory.apiKeyId || "",
+       sessionId: memory.sessionId || "",
+@@ -233,7 +258,7 @@ export async function createMemory(
+         else if (r.error && r.error !== "not_configured")
+           log.warn?.("qdrant.upsert.fail", { id: existing.id, error: r.error });
+       })
+-      .catch((e) => log.warn?.("qdrant.upsert.error", { id: existing.id, error: String(e) }));
++      .catch((e) => log.warn?.("qdrant.upsert.error", { id: existing.id, error: String(e) })));
+ 
+     return updatedMemory;
+   }
+@@ -284,7 +309,7 @@ export async function createMemory(
+   scheduleVectorUpsert(id, memory.content);
+ 
+   // Best-effort sync to semantic memory store (Qdrant). Failures do not block the SQLite write.
+-  upsertSemanticMemoryPoint({
++  trackQdrantUpsert(id, upsertSemanticMemoryPoint({
+     id,
+     apiKeyId: memory.apiKeyId || "",
+     sessionId: memory.sessionId || "",
+@@ -299,7 +324,7 @@ export async function createMemory(
+       else if (r.error && r.error !== "not_configured")
+         log.warn?.("qdrant.upsert.fail", { id, error: r.error });
+     })
+-    .catch((e) => log.warn?.("qdrant.upsert.error", { id, error: String(e) }));
++    .catch((e) => log.warn?.("qdrant.upsert.error", { id, error: String(e) })));
+ 
+   return createdMemory;
+ }
+@@ -427,7 +452,12 @@ export async function deleteMemory(id: string): Promise<boolean> {
+     );
+   }
+ 
+-  // 2. Delete from Qdrant (best-effort — already existed before plan 21)
++  // 2. Delete from Qdrant (best-effort — already existed before plan 21).
++  //    Wait for any in-flight upsert of this id first, or it lands after the
++  //    delete and leaves an orphaned point (see pendingQdrantUpserts above).
++  const pendingUpsert = pendingQdrantUpserts.get(id);
++  if (pendingUpsert) await pendingUpsert.catch(() => {});
++
+   await deleteSemanticMemoryPoint(id).catch((e: unknown) =>
+     log.warn("memory.qdrant.delete.fail", {
+       id,

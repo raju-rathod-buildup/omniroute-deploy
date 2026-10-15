@@ -1,0 +1,127 @@
+diff --git a/src/lib/guardrails/visionBridgeHelpers.ts b/src/lib/guardrails/visionBridgeHelpers.ts
+--- a/src/lib/guardrails/visionBridgeHelpers.ts
++++ b/src/lib/guardrails/visionBridgeHelpers.ts
+@@ -9,6 +9,28 @@
+ import { getBestVisionModel, getFallbackModels, recordLatency } from "./visionBridgeRouter";
+ import { REGISTRY } from "@omniroute/open-sse/config/providers";
+ import { fetch as undiciFetch } from "undici";
++
++/** Strips unsafe or empty base paths; mirrors the normalizer in modelSyncScheduler. */
++function normalizeInternalBasePath(value: string | undefined): string {
++  const trimmed = value?.trim();
++  if (!trimmed || trimmed === "/") return "";
++  if (!trimmed.startsWith("/") || /[?#\\]/.test(trimmed)) return "";
++  const segments = trimmed.split("/").filter(Boolean);
++  if (segments.some((segment) => segment === "." || segment === "..")) return "";
++  return `/${segments.join("/")}`;
++}
++
++/**
++ * Base URL for OmniRoute own /v1 API, used when the bridge calls back into the
++ * gateway. It must include OMNIROUTE_BASE_PATH (for example /omni): every route
++ * lives under that prefix, so a bare origin hits a path that does not exist and
++ * returns an HTML 404 for every image. Uses dashboardPort, as the combo-test and
++ * model-sync loopbacks do.
++ */
++export function resolveSelfLoopBaseUrl(): string {
++  const { dashboardPort } = getRuntimePorts();
++  return `http://localhost:${dashboardPort}${normalizeInternalBasePath(process.env.OMNIROUTE_BASE_PATH)}/v1`;
++}
+ /**
+  * Provider to environment variable mapping for API key resolution.
+  */
+@@ -140,8 +162,7 @@
+   if (model && model.includes("/")) {
+     const provider = model.split("/")[0].toLowerCase();
+     if (provider !== "openai" && provider !== "anthropic") {
+-      const { port } = getRuntimePorts();
+-      return `http://localhost:${port}/v1`;
++      return resolveSelfLoopBaseUrl();
+     }
+   }
+ 
+@@ -741,7 +762,7 @@
+       // OmniRoute itself or any other OpenAI-compatible endpoint instead of
+       // hardcoded api.openai.com.
+       const baseUrl = routeThroughOmniRoute
+-        ? `http://localhost:${getRuntimePorts().port}/v1`
++        ? resolveSelfLoopBaseUrl()
+         : resolveVisionBridgeBaseUrl(config.model);
+ 
+       // When routing through the OmniRoute self-loop (non-standard provider),
+diff --git a/tests/unit/vision-bridge-self-loop-basepath.test.ts b/tests/unit/vision-bridge-self-loop-basepath.test.ts
+new file mode 100644
+--- /dev/null
++++ b/tests/unit/vision-bridge-self-loop-basepath.test.ts
+@@ -0,0 +1,71 @@
++/**
++ * Vision Bridge self-loop must include OMNIROUTE_BASE_PATH.
++ *
++ * On a deployment served under a sub-path (for example /omni) the bridge sent its
++ * image-description calls to http://localhost:<port>/v1, which does not exist
++ * there, so every image failed with an HTML 404 page (90 failures, 0 bridged).
++ * Same defect class as the rerank and combo-test loopbacks.
++ */
++
++import test from "node:test";
++import assert from "node:assert/strict";
++
++const { resolveSelfLoopBaseUrl, resolveVisionBridgeBaseUrl } =
++  await import("../../src/lib/guardrails/visionBridgeHelpers.ts");
++
++const ENV_KEYS = ["OMNIROUTE_BASE_PATH", "VISION_BRIDGE_BASE_URL", "OPENAI_API_URL"];
++const ORIGINAL: Record<string, string | undefined> = {};
++for (const k of ENV_KEYS) ORIGINAL[k] = process.env[k];
++
++test.beforeEach(() => {
++  for (const k of ENV_KEYS) delete process.env[k];
++});
++
++test.afterEach(() => {
++  for (const k of ENV_KEYS) {
++    if (ORIGINAL[k] === undefined) delete process.env[k];
++    else process.env[k] = ORIGINAL[k];
++  }
++});
++
++test("self-loop URL includes the base path when OMNIROUTE_BASE_PATH is set", () => {
++  process.env.OMNIROUTE_BASE_PATH = "/omni";
++  assert.match(resolveSelfLoopBaseUrl(), /^http:\/\/localhost:\d+\/omni\/v1$/);
++});
++
++test("self-loop URL has no prefix when OMNIROUTE_BASE_PATH is unset or root", () => {
++  assert.match(resolveSelfLoopBaseUrl(), /^http:\/\/localhost:\d+\/v1$/);
++  process.env.OMNIROUTE_BASE_PATH = "/";
++  assert.match(resolveSelfLoopBaseUrl(), /^http:\/\/localhost:\d+\/v1$/);
++});
++
++test("self-loop URL normalizes a trailing slash and multi-segment base paths", () => {
++  process.env.OMNIROUTE_BASE_PATH = "/omni/";
++  assert.match(resolveSelfLoopBaseUrl(), /^http:\/\/localhost:\d+\/omni\/v1$/);
++  process.env.OMNIROUTE_BASE_PATH = "/a/b";
++  assert.match(resolveSelfLoopBaseUrl(), /^http:\/\/localhost:\d+\/a\/b\/v1$/);
++});
++
++test("self-loop URL ignores unsafe base paths", () => {
++  for (const bad of ["omni", "/../x", "/a/./b", "/x?y=1", "/x#frag", "/x\\y"]) {
++    process.env.OMNIROUTE_BASE_PATH = bad;
++    assert.match(resolveSelfLoopBaseUrl(), /^http:\/\/localhost:\d+\/v1$/, bad);
++  }
++});
++
++test("resolveVisionBridgeBaseUrl uses the base-path-aware self-loop for non-openai providers", () => {
++  process.env.OMNIROUTE_BASE_PATH = "/omni";
++  assert.match(resolveVisionBridgeBaseUrl("groq/llama-3"), /^http:\/\/localhost:\d+\/omni\/v1$/);
++});
++
++test("resolveVisionBridgeBaseUrl keeps api.openai.com for openai and unprefixed models", () => {
++  process.env.OMNIROUTE_BASE_PATH = "/omni";
++  assert.equal(resolveVisionBridgeBaseUrl("openai/gpt-4o-mini"), "https://api.openai.com/v1");
++  assert.equal(resolveVisionBridgeBaseUrl("gpt-4o-mini"), "https://api.openai.com/v1");
++});
++
++test("VISION_BRIDGE_BASE_URL still wins over the self-loop", () => {
++  process.env.OMNIROUTE_BASE_PATH = "/omni";
++  process.env.VISION_BRIDGE_BASE_URL = "https://vision.example.com/v1";
++  assert.equal(resolveVisionBridgeBaseUrl("groq/llama-3"), "https://vision.example.com/v1");
++});

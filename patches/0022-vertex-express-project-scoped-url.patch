@@ -1,0 +1,50 @@
+diff --git a/open-sse/executors/vertex.ts b/open-sse/executors/vertex.ts
+index 9d9ed6502..cb735c431 100644
+--- a/open-sse/executors/vertex.ts
++++ b/open-sse/executors/vertex.ts
+@@ -356,6 +356,15 @@ export class VertexExecutor extends BaseExecutor {
+         return `https://aiplatform.googleapis.com/v1/publishers/openapi/chat/completions?key=${expressKey}`;
+       }
+       const op = stream ? "streamGenerateContent?alt=sse&" : "generateContent?";
++      // The project-less URL carries no region, so Google resolves it to us-central1 where
++      // global-only models (e.g. gemini-4-argon) return 404. When VERTEX_EXPRESS_PROJECT_ID is
++      // set, use the project-scoped, region-aware URL instead (region defaults to "global").
++      const expressProject = process.env.VERTEX_EXPRESS_PROJECT_ID;
++      if (expressProject) {
++        const expressRegion = credentials?.providerSpecificData?.region || "global";
++        const host = expressRegion === "global" ? "aiplatform" : `${expressRegion}-aiplatform`;
++        return `https://${host}.googleapis.com/v1/projects/${expressProject}/locations/${expressRegion}/publishers/google/models/${model}:${op}key=${expressKey}`;
++      }
+       return `https://aiplatform.googleapis.com/v1/publishers/google/models/${model}:${op}key=${expressKey}`;
+     }
+ 
+diff --git a/tests/unit/vertex-express-apikey.test.ts b/tests/unit/vertex-express-apikey.test.ts
+index 555b11c1d..9256a083d 100644
+--- a/tests/unit/vertex-express-apikey.test.ts
++++ b/tests/unit/vertex-express-apikey.test.ts
+@@ -100,3 +100,25 @@ test("execute with an Express key calls the publisher endpoint directly (no OAut
+     globalThis.fetch = originalFetch;
+   }
+ });
++
++test("buildUrl Express: VERTEX_EXPRESS_PROJECT_ID switches to the project-scoped global URL", () => {
++  const prev = process.env.VERTEX_EXPRESS_PROJECT_ID;
++  process.env.VERTEX_EXPRESS_PROJECT_ID = "proj-1";
++  try {
++    const executor = new VertexExecutor();
++    assert.equal(
++      executor.buildUrl("gemini-4-argon", false, 0, { apiKey: "k-express" }),
++      "https://aiplatform.googleapis.com/v1/projects/proj-1/locations/global/publishers/google/models/gemini-4-argon:generateContent?key=k-express"
++    );
++    assert.equal(
++      executor.buildUrl("gemini-4-argon", true, 0, {
++        apiKey: "k-express",
++        providerSpecificData: { region: "europe-west4" },
++      }),
++      "https://europe-west4-aiplatform.googleapis.com/v1/projects/proj-1/locations/europe-west4/publishers/google/models/gemini-4-argon:streamGenerateContent?alt=sse&key=k-express"
++    );
++  } finally {
++    if (prev === undefined) delete process.env.VERTEX_EXPRESS_PROJECT_ID;
++    else process.env.VERTEX_EXPRESS_PROJECT_ID = prev;
++  }
++});

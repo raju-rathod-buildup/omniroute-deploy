@@ -1,0 +1,29 @@
+diff --git a/open-sse/config/imageRegistry.ts b/open-sse/config/imageRegistry.ts
+index fe455fc89..12f5582d7 100644
+--- a/open-sse/config/imageRegistry.ts
++++ b/open-sse/config/imageRegistry.ts
+@@ -301,6 +301,24 @@ export const IMAGE_PROVIDERS: Record<string, ImageProviderConfig> = {
+     supportedSizes: ["1024x1024", "2048x2048"],
+   },
+ 
++  // Logfare has no per-connection dependency: without this entry, image requests fell into
++  // the generic custom-node path, which defaults to the Gemini endpoint whenever the
++  // connection's providerSpecificData.baseUrl is empty ("Please pass a valid API key").
++  logfare: {
++    id: "logfare",
++    baseUrl: "https://logfare.ai/v1/images/generations",
++    authType: "apikey",
++    authHeader: "bearer",
++    format: "openai",
++    models: [
++      { id: "flux-1-schnell", name: "FLUX.1 Schnell" },
++      { id: "flux-2-klein-4b", name: "FLUX.2 Klein 4B" },
++      { id: "flux-2-klein-9b", name: "FLUX.2 Klein 9B" },
++      { id: "sdxl-lightning", name: "SDXL Lightning" },
++    ],
++    supportedSizes: ["1024x1024"],
++  },
++
+   "vercel-ai-gateway": {
+     id: "vercel-ai-gateway",
+     alias: "vag",

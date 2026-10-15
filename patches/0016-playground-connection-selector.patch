@@ -1,0 +1,251 @@
+diff --git a/src/app/(dashboard)/dashboard/media-providers/components/LlmChatCard.tsx b/src/app/(dashboard)/dashboard/media-providers/components/LlmChatCard.tsx
+index a6a1b02c4..59e94a650 100644
+--- a/src/app/(dashboard)/dashboard/media-providers/components/LlmChatCard.tsx
++++ b/src/app/(dashboard)/dashboard/media-providers/components/LlmChatCard.tsx
+@@ -12,10 +12,20 @@ import { useTranslations } from "next-intl";
+ import { cn } from "@/shared/utils/cn";
+ import { useApiKey } from "../../providers/hooks/useApiKey";
+ import { useProviderModels } from "../../providers/hooks/useProviderModels";
++import { useProviderConnectionOptions } from "../../providers/hooks/useProviderConnectionOptions";
+ import { getProviderAlias } from "@/shared/constants/providers";
+ 
+ const ENDPOINT = "/api/v1/chat/completions";
+ 
++/** Header that pins the request to one specific upstream connection/account
++ *  instead of letting normal fallback/round-robin pick among the provider's
++ *  connections — same mechanism the "Test model" runner uses
++ *  (src/lib/api/modelTestRunner.ts), read server-side in
++ *  src/sse/handlers/chat.ts. Distinct from PLAYGROUND_KEY_ID_HEADER below:
++ *  that picks a client-facing API key to test its policy; this picks which
++ *  upstream account actually serves the request. */
++const PLAYGROUND_CONNECTION_ID_HEADER = "x-omniroute-connection";
++
+ /** Header used to test a specific API key's policy from the dashboard playground
+  *  without exposing the key secret to the browser — the gateway resolves the key
+  *  by id server-side (see enforceApiKeyPolicy). */
+@@ -27,7 +37,7 @@ const PLAYGROUND_KEY_ID_HEADER = "x-omniroute-playground-key-id";
+  * gateway so it can apply that key's policy (allowed_models, etc.) server-side.
+  * Returns null for "(default)", which falls through to the dashboard session.
+  */
+-function resolvePlaygroundKeyId(
++export function resolvePlaygroundKeyId(
+   selectedMaskedKey: string,
+   keys: { id: string; key: string }[]
+ ): string | null {
+@@ -35,6 +45,16 @@ function resolvePlaygroundKeyId(
+   return keys.find((k) => k.key === selectedMaskedKey)?.id ?? null;
+ }
+ 
++/**
++ * Whether the "Connection" picker is worth showing. With 0 or 1 connections
++ * there is nothing to choose between, so the control would just be clutter
++ * next to "Select Key" — only render it once a provider has more than one
++ * connection to pin a request to.
++ */
++export function shouldOfferConnectionSelector(connections: { id: string }[]): boolean {
++  return connections.length > 1;
++}
++
+ // Mirrors NO_THINKING_PREFIX in open-sse/utils/noThinkingAlias.ts — kept as a local literal
+ // (not imported) to avoid pulling server-side catalog modules into the client bundle.
+ const NO_THINKING_PREFIX = "no-think/";
+@@ -147,8 +167,10 @@ export function LlmChatCard({
+   const t = useTranslations("miniPlayground");
+   const { keys } = useApiKey();
+   const { models, loading, error, retry } = useProviderModels(providerId);
++  const { connections } = useProviderConnectionOptions(providerId);
+ 
+   const [internalSelectedKey, setInternalSelectedKey] = useState<string>("");
++  const [selectedConnectionId, setSelectedConnectionId] = useState<string>("");
+   const [internalModel, setInternalModel] = useState<string>(initialModel ?? "");
+   const selectedKey = selectedKeyProp ?? internalSelectedKey;
+   const setSelectedKey = useCallback(
+@@ -231,6 +253,7 @@ export function LlmChatCard({
+       };
+       const playgroundKeyId = resolvePlaygroundKeyId(selectedKey, keys);
+       if (playgroundKeyId) headers[PLAYGROUND_KEY_ID_HEADER] = playgroundKeyId;
++      if (selectedConnectionId) headers[PLAYGROUND_CONNECTION_ID_HEADER] = selectedConnectionId;
+       const res = await fetch(ENDPOINT, {
+         method: "POST",
+         signal: controller.signal,
+@@ -348,7 +371,17 @@ export function LlmChatCard({
+       // Refocus textarea so user can keep typing
+       requestAnimationFrame(() => textareaRef.current?.focus());
+     }
+-  }, [input, streaming, selectedKey, keys, providerId, qualifiedModel, messages, t]);
++  }, [
++    input,
++    streaming,
++    selectedKey,
++    keys,
++    selectedConnectionId,
++    providerId,
++    qualifiedModel,
++    messages,
++    t,
++  ]);
+ 
+   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+     if (e.key === "Enter" && !e.shiftKey) {
+@@ -448,6 +481,28 @@ export function LlmChatCard({
+               </select>
+             </div>
+           )}
++          {/* Connection select — pins the request to one upstream account via
++              X-OmniRoute-Connection instead of the default fallback/round-robin
++              pick. Only worth showing once there is more than one to choose from. */}
++          {shouldOfferConnectionSelector(connections) && (
++            <div className="flex items-center gap-1.5">
++              <label className="text-xs text-text-muted shrink-0">
++                {t("selectConnection") ?? "Connection"}:
++              </label>
++              <select
++                value={selectedConnectionId}
++                onChange={(e) => setSelectedConnectionId(e.target.value)}
++                className="rounded-md border border-border bg-bg-subtle text-xs px-2 py-1 text-text-main focus:outline-none focus:ring-1 focus:ring-primary"
++              >
++                <option value="">{t("defaultConnection") ?? "(auto)"}</option>
++                {connections.map((c) => (
++                  <option key={c.id} value={c.id}>
++                    {c.name ?? c.id}
++                  </option>
++                ))}
++              </select>
++            </div>
++          )}
+           {/* Clear button */}
+           {messages.length > 0 && (
+             <button
+diff --git a/src/i18n/messages/en.json b/src/i18n/messages/en.json
+index 508e3f4ee..5d22d4047 100644
+--- a/src/i18n/messages/en.json
++++ b/src/i18n/messages/en.json
+@@ -11198,6 +11198,7 @@
+     "tunnel": "Tunnel",
+     "send": "Send",
+     "selectKey": "Select key",
++    "selectConnection": "Connection",
+     "testLabel": "Test",
+     "expandTest": "Expand test",
+     "collapseTest": "Collapse test",
+@@ -11240,6 +11241,7 @@
+     "latency": "{ms}ms",
+     "statsLine": "{ms}ms · {tokensIn} in / {tokensOut} out tokens",
+     "defaultKey": "(default)",
++    "defaultConnection": "(auto)",
+     "clear": "Clear",
+     "emptyConversation": "Send a message to start the conversation",
+     "sendHint": "Shift+Enter for newline · Enter to send",
+diff --git a/src/app/(dashboard)/dashboard/providers/hooks/useProviderConnectionOptions.ts b/src/app/(dashboard)/dashboard/providers/hooks/useProviderConnectionOptions.ts
+new file mode 100644
+index 000000000..f5e534773
+--- /dev/null
++++ b/src/app/(dashboard)/dashboard/providers/hooks/useProviderConnectionOptions.ts
+@@ -0,0 +1,60 @@
++"use client";
++
++import { useEffect, useState } from "react";
++
++export interface ProviderConnectionOption {
++  id: string;
++  name?: string;
++  isActive?: boolean;
++  testStatus?: string;
++}
++
++interface UseProviderConnectionOptionsResult {
++  connections: ProviderConnectionOption[];
++  loading: boolean;
++}
++
++/**
++ * useProviderConnectionOptions — fetch this provider's connections from
++ * GET /api/providers?provider=<id> for a playground "Connection" picker.
++ *
++ * Lets the playground pin a specific upstream account (via the
++ * X-OmniRoute-Connection request header) instead of always letting normal
++ * fallback/round-robin pick among the provider's connections — useful for
++ * reproducing an issue on one particular account. Distinct from the
++ * "Select Key" control, which picks an OmniRoute client-facing API key to
++ * test that key's policy, not which upstream connection serves the request.
++ */
++export function useProviderConnectionOptions(providerId: string): UseProviderConnectionOptionsResult {
++  const [connections, setConnections] = useState<ProviderConnectionOption[]>([]);
++  const [loading, setLoading] = useState<boolean>(true);
++
++  useEffect(() => {
++    if (!providerId) {
++      setConnections([]);
++      setLoading(false);
++      return;
++    }
++    let cancelled = false;
++    const load = async () => {
++      setLoading(true);
++      try {
++        const res = await fetch(`/api/providers?provider=${encodeURIComponent(providerId)}`);
++        if (!res.ok) return;
++        const data = (await res.json()) as { connections?: ProviderConnectionOption[] };
++        if (cancelled) return;
++        setConnections(Array.isArray(data.connections) ? data.connections : []);
++      } catch {
++        // silently ignore — the playground is non-critical
++      } finally {
++        if (!cancelled) setLoading(false);
++      }
++    };
++    void load();
++    return () => {
++      cancelled = true;
++    };
++  }, [providerId]);
++
++  return { connections, loading };
++}
+diff --git a/tests/unit/playground-connection-select.test.ts b/tests/unit/playground-connection-select.test.ts
+new file mode 100644
+index 000000000..d8f15bd3b
+--- /dev/null
++++ b/tests/unit/playground-connection-select.test.ts
+@@ -0,0 +1,41 @@
++import test from "node:test";
++import assert from "node:assert/strict";
++
++const { resolvePlaygroundKeyId, shouldOfferConnectionSelector } = await import(
++  "../../src/app/(dashboard)/dashboard/media-providers/components/LlmChatCard.tsx"
++);
++
++// The playground's "Select Key" control (an OmniRoute client-facing API key,
++// tests that key's policy) and its "Connection" control (which upstream
++// account actually serves the request, via the X-OmniRoute-Connection
++// header — src/lib/api/modelTestRunner.ts / src/sse/handlers/chat.ts) answer
++// different questions and must not be conflated.
++
++test("shouldOfferConnectionSelector hides the picker with zero connections", () => {
++  assert.equal(shouldOfferConnectionSelector([]), false);
++});
++
++test("shouldOfferConnectionSelector hides the picker with exactly one connection", () => {
++  // Nothing to choose between — showing a single-option dropdown next to
++  // "Select Key" would just be clutter.
++  assert.equal(shouldOfferConnectionSelector([{ id: "conn-1" }]), false);
++});
++
++test("shouldOfferConnectionSelector shows the picker once there is a real choice", () => {
++  assert.equal(
++    shouldOfferConnectionSelector([{ id: "conn-1" }, { id: "conn-2" }]),
++    true
++  );
++});
++
++test("resolvePlaygroundKeyId resolves the masked key back to its id", () => {
++  const keys = [
++    { id: "key-1", key: "sk-aaaa****1111" },
++    { id: "key-2", key: "sk-bbbb****2222" },
++  ];
++  assert.equal(resolvePlaygroundKeyId("sk-bbbb****2222", keys), "key-2");
++});
++
++test("resolvePlaygroundKeyId returns null for the default (no key selected)", () => {
++  assert.equal(resolvePlaygroundKeyId("", [{ id: "key-1", key: "sk-aaaa" }]), null);
++});

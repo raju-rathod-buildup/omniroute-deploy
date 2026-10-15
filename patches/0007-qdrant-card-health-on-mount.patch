@@ -1,0 +1,21 @@
+diff --git a/src/app/(dashboard)/dashboard/memory/components/QdrantConfigCard.tsx b/src/app/(dashboard)/dashboard/memory/components/QdrantConfigCard.tsx
+index 68ab223..32c6bbb 100644
+--- a/src/app/(dashboard)/dashboard/memory/components/QdrantConfigCard.tsx
++++ b/src/app/(dashboard)/dashboard/memory/components/QdrantConfigCard.tsx
+@@ -51,8 +51,15 @@ export default function QdrantConfigCard() {
+     Promise.all([
+       fetch("/api/settings/qdrant").then((r) => (r.ok ? r.json() : null)),
+       fetch("/api/settings/qdrant/embedding-models").then((r) => (r.ok ? r.json() : null)),
++      // Health is fetched on mount too. Without this the card only ever learns
++      // its health from the manual test button, while the indicator renders
++      // `health?.ok ? green : red` — so a null (never-checked) health shows a RED
++      // dot and "statusError" on every page load, even when Qdrant is perfectly
++      // healthy. Clicking test turned it green; refreshing turned it red again.
++      fetch("/api/settings/qdrant/health").then((r) => (r.ok ? r.json() : null)),
+     ])
+-      .then(([qdrantData, embeddingData]) => {
++      .then(([qdrantData, embeddingData, healthData]) => {
++        if (healthData) setHealth(healthData);
+         if (qdrantData) {
+           setQdrant(qdrantData);
+           setApiKeyInput("");

@@ -1,0 +1,142 @@
+diff --git a/src/app/(dashboard)/dashboard/providers/components/onboarding/providerOnboardingHref.ts b/src/app/(dashboard)/dashboard/providers/components/onboarding/providerOnboardingHref.ts
+index 46885cc35..017e99738 100644
+--- a/src/app/(dashboard)/dashboard/providers/components/onboarding/providerOnboardingHref.ts
++++ b/src/app/(dashboard)/dashboard/providers/components/onboarding/providerOnboardingHref.ts
+@@ -8,26 +8,31 @@ export interface OnboardingSummaryAction {
+ /**
+  * Minimum surface area required to compute the dashboard details href.
+  * Accepts either a full {@link OnboardingConnection} or any partial that
+- * exposes the server-assigned UUID under `id`.
++ * exposes the routing slug under `provider`.
+  */
+-export type HrefConnection = Pick<OnboardingConnection, "id"> & {
+-  provider?: string;
++export type HrefConnection = Pick<OnboardingConnection, "provider"> & {
++  id?: string;
+ };
+ 
+ /**
+  * Build the "open provider details" link target for the onboarding wizard
+- * success card. The dashboard detail route is keyed by the connection's
+- * server-assigned UUID (`OnboardingConnection.id`), not by the provider
+- * category (`connection.provider` is e.g. "openai-compatible" and is shared
+- * across many connections).
++ * success card. `/dashboard/providers/[id]` (ProviderDetailPageClient.tsx)
++ * resolves its route param as the provider catalog slug (via
++ * resolveDashboardProviderInfo -> resolveStaticProviderCatalogEntry) or as a
++ * compatible-node id (via `/api/provider-nodes`, matched by `entry.id`) — it
++ * never looks up a connection by its own row id. The wizard itself creates
++ * connections with `provider: selectedProvider.id` (built-in) or
++ * `provider: node.id` (compatible), so `connection.provider` is exactly the
++ * routing id the details page expects; `connection.id` (the credential row's
++ * own UUID) 404s as "Provider not found".
+  *
+- * Returns `null` if no usable id is present so callers can hide the action
++ * Returns `null` if no usable slug is present so callers can hide the action
+  * entirely rather than linking to a 404.
+  */
+ export function buildProviderDetailsHref(
+   connection: HrefConnection | null | undefined
+ ): string | null {
+-  const id = connection?.id?.trim();
+-  if (!id) return null;
+-  return `/dashboard/providers/${encodeURIComponent(id)}`;
++  const provider = connection?.provider?.trim();
++  if (!provider) return null;
++  return `/dashboard/providers/${encodeURIComponent(provider)}`;
+ }
+\ No newline at end of file
+diff --git a/tests/unit/provider-onboarding-href.test.ts b/tests/unit/provider-onboarding-href.test.ts
+index 95548d0ca..43d831633 100644
+--- a/tests/unit/provider-onboarding-href.test.ts
++++ b/tests/unit/provider-onboarding-href.test.ts
+@@ -1,37 +1,51 @@
+-import { test } from "node:test";
+-import assert from "node:assert/strict";
+-import { buildProviderDetailsHref } from "../../src/app/(dashboard)/dashboard/providers/components/onboarding/providerOnboardingHref";
+-
+-test("buildProviderDetailsHref uses the server-assigned connection UUID", () => {
+-  const href = buildProviderDetailsHref({
+-    id: "9f3c1a4d-1c2b-4a3c-8def-0123456789ab",
+-  });
+-  assert.equal(
+-    href,
+-    "/dashboard/providers/9f3c1a4d-1c2b-4a3c-8def-0123456789ab"
+-  );
+-});
+-
+-test("buildProviderDetailsHref does not leak the provider category into the URL", () => {
+-  // Regression for issue #6144: previously the wizard used
+-  // `connection.provider` ("openai-compatible") as the URL slug, which 404'd
+-  // on /dashboard/providers/[id] because that route is keyed by UUID.
+-  const href = buildProviderDetailsHref({
+-    id: "9f3c1a4d-1c2b-4a3c-8def-0123456789ab",
+-    provider: "openai-compatible",
+-  });
+-  assert.notEqual(href, "/dashboard/providers/openai-compatible");
+-  assert.match(href ?? "", /\/dashboard\/providers\/[0-9a-f-]+$/);
+-});
+-
+-test("buildProviderDetailsHref returns null when no id is available", () => {
+-  assert.equal(buildProviderDetailsHref(null), null);
+-  assert.equal(buildProviderDetailsHref(undefined), null);
+-  assert.equal(buildProviderDetailsHref({ id: "" }), null);
+-  assert.equal(buildProviderDetailsHref({ id: "   " }), null);
+-});
+-
+-test("buildProviderDetailsHref percent-encodes unusual ids", () => {
+-  const href = buildProviderDetailsHref({ id: "abc/123 def" });
+-  assert.equal(href, "/dashboard/providers/abc%2F123%20def");
+-});
+\ No newline at end of file
++import { test } from "node:test";
++import assert from "node:assert/strict";
++import { buildProviderDetailsHref } from "../../src/app/(dashboard)/dashboard/providers/components/onboarding/providerOnboardingHref";
++
++// Regression guard: the dashboard detail route `/dashboard/providers/[id]`
++// (ProviderDetailPageClient.tsx) resolves `params.id` as the provider
++// catalog slug (e.g. "dahl") via resolveDashboardProviderInfo(), or as a
++// compatible-node id via `/api/provider-nodes` (`entry.id === providerId`).
++// It never looks up a connection by its own row id. The onboarding wizard
++// itself creates connections with `provider: selectedProvider.id` (built-in)
++// or `provider: node.id` (compatible) — so `connection.provider` is exactly
++// the routing id the details page expects, while `connection.id` (the
++// credential row's own UUID) is not looked up anywhere on that page and
++// 404s as "Provider not found".
++
++test("buildProviderDetailsHref routes by the connection's provider slug", () => {
++  const href = buildProviderDetailsHref({
++    id: "9f3c1a4d-1c2b-4a3c-8def-0123456789ab",
++    provider: "dahl",
++  });
++  assert.equal(href, "/dashboard/providers/dahl");
++});
++
++test("buildProviderDetailsHref does not leak the connection row id into the URL", () => {
++  const href = buildProviderDetailsHref({
++    id: "b0beb806-5081-487f-b995-b85f30ca07f6",
++    provider: "dahl",
++  });
++  assert.notEqual(href, "/dashboard/providers/b0beb806-5081-487f-b995-b85f30ca07f6");
++});
++
++test("buildProviderDetailsHref works for a compatible-node connection (provider = node id)", () => {
++  const href = buildProviderDetailsHref({
++    id: "9f3c1a4d-1c2b-4a3c-8def-0123456789ab",
++    provider: "compat-node-abc123",
++  });
++  assert.equal(href, "/dashboard/providers/compat-node-abc123");
++});
++
++test("buildProviderDetailsHref returns null when no provider slug is available", () => {
++  assert.equal(buildProviderDetailsHref(null), null);
++  assert.equal(buildProviderDetailsHref(undefined), null);
++  assert.equal(buildProviderDetailsHref({ id: "abc", provider: "" }), null);
++  assert.equal(buildProviderDetailsHref({ id: "abc", provider: "   " }), null);
++  assert.equal(buildProviderDetailsHref({ id: "abc" }), null);
++});
++
++test("buildProviderDetailsHref percent-encodes unusual provider slugs", () => {
++  const href = buildProviderDetailsHref({ id: "abc", provider: "abc/123 def" });
++  assert.equal(href, "/dashboard/providers/abc%2F123%20def");
++});

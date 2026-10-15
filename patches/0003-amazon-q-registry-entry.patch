@@ -1,0 +1,20 @@
+diff --git a/open-sse/config/providers/index.ts b/open-sse/config/providers/index.ts
+index fa9ba3b06..add38f165 100644
+--- a/open-sse/config/providers/index.ts
++++ b/open-sse/config/providers/index.ts
+@@ -492,6 +492,15 @@ export const REGISTRY: Record<string, RegistryEntry> = {
+   "uc-direct": ucDirectProvider,
+   venice: veniceProvider,
+   kiro: kiroProvider,
++  // LOCAL PATCH 0003 — Amazon Q shares Kiro's backend, executor and OAuth wiring
++  // (see executors/index.ts: `new KiroExecutor("amazon-q")`), but upstream ships no
++  // registry entry for it. Without one, getTargetFormat("amazon-q") falls through
++  // `getRegistryEntry` → `getProviderConfig` and returns "openai", so the
++  // openai→kiro translator never runs and the RAW OpenAI body
++  // ({messages,max_tokens,stream}) is POSTed to codewhisperer.amazonaws.com, which
++  // answers `400 Improperly formed request`. KiroExecutor already falls back to
++  // PROVIDERS.kiro for its own config; this makes the FORMAT resolution agree.
++  "amazon-q": { ...kiroProvider, id: "amazon-q", alias: "aq" },
+   byteplus: byteplusProvider,
+   wafer: waferProvider,
+   openadapter: openadapterProvider,

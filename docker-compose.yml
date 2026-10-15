@@ -1,0 +1,175 @@
+# ══════════════════════════════════════════════════════════════════════════
+#  OmniRoute — served under /omni behind nginx (see nginx/)
+#
+#  Deliberately NOT the upstream docker-compose.yml: upstream's `web` profile
+#  BUILDS the image from source (target: runner-web). This stack uses the
+#  pre-built Docker Hub image and lets the entrypoint apply the /omni base path
+#  at startup, so nothing is compiled on this VPS.
+#
+#  Usage:  ./scripts/build.sh && cp .env.example .env && (edit .env) && docker compose up -d
+#  Config: .env  (chmod 600 — holds the secrets)
+# ══════════════════════════════════════════════════════════════════════════
+
+services:
+  # ── Redis: rate-limiter / cache backend ─────────────────────────────────
+  # No host port published on purpose. The app reaches it over the compose
+  # network as redis:6379, and this Redis has no requirepass — publishing it
+  # would put an unauthenticated Redis on a host interface.
+  redis:
+    image: docker.io/library/redis:8.6.5-alpine
+    container_name: omniroute-redis
+    restart: unless-stopped
+    command: redis-server --save 60 1 --loglevel warning
+    volumes:
+      - redis-data:/data
+    mem_limit: 512m
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # ── Qdrant: vector store for semantic memory ──────────────────────────────
+  # Loopback-only on purpose. Qdrant ships with NO authentication, and this host
+  # has no firewall (ufw inactive, iptables policy ACCEPT), so upstream's
+  # "${QDRANT_PORT:-6333}:6333" — which binds 0.0.0.0 — would publish an open
+  # vector database containing memory text to the internet. The app reaches it
+  # over the compose network as qdrant:6333; the published port below exists
+  # only for host-side debugging.
+  #
+  # Deliberately NOT a depends_on of the app: a broken vector store must never
+  # take the gateway down. Memory degrades to sqlite-vec/FTS5 instead.
+  qdrant:
+    image: qdrant/qdrant:v1.12.4
+    container_name: omniroute-qdrant
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:6333:6333"
+    volumes:
+      - qdrant-data:/qdrant/storage
+    mem_limit: 1g
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/127.0.0.1/6333' 2>/dev/null || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ── OmniRoute (web image: bundles Chromium for web-cookie providers) ────
+  omniroute:
+    image: ${OMNIROUTE_IMAGE:-omniroute:3.8.51-web-omni-src22}
+    container_name: omniroute
+    restart: unless-stopped
+    stop_grace_period: 40s
+    env_file: .env
+    depends_on:
+      redis:
+        condition: service_healthy
+    ports:
+      # Loopback only — nginx is the sole public entrance.
+      - "127.0.0.1:20128:20128"   # dashboard + /omni/v1/* inference API
+      - "127.0.0.1:20132:20132"   # live-monitoring WebSocket
+    volumes:
+      - ./data:/app/data          # SQLite DB, logs, backups (host uid/gid 1000)
+      # transformers.js caches the embedding model inside its own package dir and
+      # offers no env var to relocate it (cacheDir is JS-level only), so without
+      # this mount the ~23 MB MiniLM model is discarded on every container
+      # recreate and re-downloaded on the next embedding call.
+      - ./data/hf-cache:/app/node_modules/@huggingface/transformers/.cache
+      # Qoder is a CLI-backed provider: the executor shells out to `qodercli`,
+      # which the app image does not ship (same failure mode as auggie). Mounting
+      # the vendor's own npm package (@qoder-ai/qodercli) keeps it out of the
+      # image, so it survives a recreate and updates with a plain `npm update`.
+      - ./cli-tools:/app/cli-tools:ro
+    environment:
+      CLI_QODER_BIN: /app/cli-tools/node_modules/.bin/qodercli
+    shm_size: "1gb"               # Chromium needs shared memory to render
+    mem_limit: 6g
+    # memswap_limit == mem_limit => no swap for this container. On 12 Oct 2026
+    # 3.4 GB of its heap sat in swap (host RAM shared with the dev stacks), and
+    # every GC / page touch stalled the event loop for seconds -> the dashboard's
+    # "Server is unreachable" banner and a live-ws reconnect storm. Steady-state
+    # use is ~1.4 GB, so 6 GB leaves ample headroom; the host's other containers
+    # keep their swap.
+    memswap_limit: 6g
+    # Caps omniroute at 2 of the host's 4 cores. On 12 Oct 2026 a few agent
+    # sessions resending 130k-240k-token histories (95 context-compression runs
+    # in 10 min) held the container at 110-156% CPU, starving the dev stacks
+    # that share this box. Peak observed was ~1.6 cores, so 2 leaves headroom.
+    # Applied live with `docker update --cpus 2 omniroute`; this keeps it across
+    # a recreate.
+    cpus: 2
+    healthcheck:
+      # healthcheck.mjs probes /healthz prefixed with OMNIROUTE_BASE_PATH.
+      test: ["CMD", "node", "healthcheck.mjs"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 90s           # first boot also rewrites the bundle for /omni
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  # ── Local cross-encoder reranker ───────────────────────────────────────────
+  # Keeps memory rerank free and offline. The gateway's rerank registry is all
+  # cloud providers, but /v1/rerank also accepts "local provider_nodes" whose
+  # baseUrl resolves to localhost/127.0.0.1/172.16-31.x.x (SSRF allowlist).
+  #
+  # Published on the bridge GATEWAY address (172.24.0.1) rather than 0.0.0.0 —
+  # this host has a public IP and the reranker must never be reachable from it.
+  # The gateway address is also stable, unlike a container IP, so the registered
+  # provider_node baseUrl keeps working across restarts.
+  #
+  # Runs the app image itself: it already ships @huggingface/transformers and
+  # onnxruntime-node, so there is no second runtime to maintain. The script must
+  # live under /app — Node resolves node_modules from the script's directory.
+  rerank:
+    image: ${OMNIROUTE_IMAGE:-omniroute:3.8.51-web-omni-src22}
+    container_name: omniroute-rerank
+    entrypoint: ["node", "/app/rerank-svc/server.mjs"]
+    restart: unless-stopped
+    environment:
+      HF_HOME: /app/data/hf-cache
+      PORT: "8790"
+    ports:
+      - "172.24.0.1:8790:8790"
+    volumes:
+      - ./local-rerank:/app/rerank-svc:ro
+      - ./data/hf-cache:/app/data/hf-cache
+    healthcheck:
+      # The app image ships HEALTHCHECK node healthcheck.mjs, which probes the Next.js
+      # health route. This sidecar only serves /v1/models and /v1/rerank, so the
+      # inherited check 404s forever and the container reports unhealthy while working.
+      test: ["CMD", "node", "-e", "require('http').get({host:'127.0.0.1',port:8790,path:'/v1/models',timeout:4000},r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      start_period: 90s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  # Pinned so the rerank sidecar's bridge-gateway address (172.24.0.1) is the same
+  # on every host. The reranker's provider_node baseUrl is stored in the DB and
+  # points at it. If 172.24.0.0/16 clashes with another Docker network, change it
+  # here AND the baseUrl in the dashboard.
+  default:
+    ipam:
+      config:
+        - subnet: 172.24.0.0/16
+
+volumes:
+  redis-data:
+    name: omniroute-redis-data
+  qdrant-data:
+    name: omniroute-qdrant-data
